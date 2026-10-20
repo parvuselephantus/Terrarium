@@ -1,6 +1,8 @@
 <#
-AI Cage 0.3.0 - isolated Debian VMs on Hyper-V for AI agents.
-Start it with AiCage.cmd (it asks for Administrator rights).   AiCage.cmd console = commands only.
+Terrarium 0.4.0 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
+(Formerly "AI Cage": internal names - the .aicage folder, the AICage switch, the Aic commands -
+keep the old name so existing VMs go on working.)
+Start it with Terrarium.cmd (it asks for Administrator rights).   Terrarium.cmd console = commands only.
 
 Part 1 is the engine (loaded as an in-memory PowerShell module), part 2 the window.
 Keep this file ASCII-only: Windows PowerShell 5.1 reads BOM-less files as ANSI.
@@ -17,7 +19,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
 # ---- Private/Cleanup.ps1 --------------------------------------------------------------
-# Leftovers: things AI Cage made for VMs that no longer exist (e.g. a VM deleted in Hyper-V
+# Leftovers: things Terrarium made for VMs that no longer exist (e.g. a VM deleted in Hyper-V
 # Manager instead of with Remove-AicVm, or a removal that stopped half way).
 
 function Get-AicLeftovers {
@@ -25,7 +27,7 @@ function Get-AicLeftovers {
     $items = New-Object System.Collections.Generic.List[object]
 
     Get-LocalUser -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -like 'aic-*' -and "$($_.Description)" -like 'AI Cage*' -and $names -notcontains $_.Name.Substring(4) } |
+        Where-Object { $_.Name -like 'aic-*' -and ("$($_.Description)" -like 'Terrarium*' -or "$($_.Description)" -like 'AI Cage*') -and $names -notcontains $_.Name.Substring(4) } |
         ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'Account'; Name = $_.Name; Detail = 'share account'; Sid = $_.SID.Value }) }
 
     Get-SmbShare -ErrorAction SilentlyContinue |
@@ -41,6 +43,11 @@ function Get-AicLeftovers {
         Get-ChildItem $putty | Where-Object { $_.PSChildName -like 'AICage-*' -and $names -notcontains $_.PSChildName.Substring(7) } |
             ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'PuTTY'; Name = $_.PSChildName; Detail = 'saved PuTTY session'; Sid = $null }) }
     }
+
+    # Port forwards to an address in the VM subnet that no VM has any more.
+    $ips = @(Get-AicState | ForEach-Object { $_.Ip })
+    Get-AicPortProxy | Where-Object { $_.ConnectAddress -like "$((Get-AicConfig).SubnetBase).*" -and $ips -notcontains $_.ConnectAddress } |
+        ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'Port'; Name = "$($_.ListenAddress):$($_.ListenPort)"; Detail = "forward to $($_.ConnectAddress):$($_.ConnectPort)"; Sid = $_ }) }
 
     # The fixed folder AI Cage 0.1 used, unless it is still the tool folder or holds a VM.
     $old = 'C:\AICage'
@@ -81,6 +88,7 @@ function Remove-AicLeftovers {
                 'Share' { Write-AicLog "Remove-SmbShare $($it.Name)" -Level Cmd; Remove-SmbShare -Name $it.Name -Force }
                 'Firewall' { Write-AicLog "Remove-NetFirewallRule $($it.Name)" -Level Cmd; Remove-NetFirewallRule -Name $it.Name }
                 'PuTTY' { Write-AicLog "Remove PuTTY session $($it.Name)" -Level Cmd; Remove-Item "HKCU:\Software\SimonTatham\PuTTY\Sessions\$($it.Name)" -Recurse -Force }
+                'Port' { Remove-AicPortProxy -Entry $it.Sid }
                 'Account' {
                     Write-AicLog "Remove user rights and account $($it.Name)" -Level Cmd
                     [AiCage.Native.Lsa]::RemoveAllRights($it.Sid)
@@ -143,12 +151,15 @@ function Get-AicDefaultKeyboard {
 function ConvertTo-AicYamlString([string]$s) { return "'" + $s.Replace("'", "''") + "'" }
 function ConvertTo-AicB64([string]$s) { return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($s -replace "`r`n", "`n"))) }
 
+# Runs as root. Written to disk every 30 s (not 5 min), so even a hard hang leaves its traces.
+$script:AicJournalSetup = 'mkdir -p /etc/systemd/journald.conf.d /var/log/journal && printf "[Journal]\nStorage=persistent\nSyncIntervalSec=30s\n" > /etc/systemd/journald.conf.d/terrarium.conf && systemd-tmpfiles --create --prefix /var/log/journal && systemctl restart systemd-journald'
+
 function New-AicFirstBootScript {
     param($State, [string]$Keyboard)
     $ro = if ($State.SharedReadOnly) { '1' } else { '0' }
     $lines = @(
         '#!/bin/bash'
-        '# AI Cage first-boot setup. Runs once, from cloud-init; output lands in /var/log/cloud-init-output.log.'
+        '# Terrarium first-boot setup. Runs once, from cloud-init; output lands in /var/log/cloud-init-output.log.'
         'set -u'
         "USER_NAME='$($State.User)'; HOST_IP='$(Get-AicHostIp)'; SHARE='$($State.ShareName)'; RO='$ro'; KB='$Keyboard'"
         'log() { echo "aicage: $*"; }'
@@ -158,6 +169,8 @@ function New-AicFirstBootScript {
         '  locale-gen >/dev/null && update-locale LANG=en_US.UTF-8 && log "locale en_US.UTF-8"'
         'fi'
         '[ -f /etc/default/keyboard ] && sed -i "s/^XKBLAYOUT=.*/XKBLAYOUT=\"$KB\"/" /etc/default/keyboard'
+        '# Keep the system log across restarts: after a hang, "journalctl -b -1" shows what happened.'
+        $script:AicJournalSetup
         ''
         'uid=$(id -u "$USER_NAME"); gid=$(id -g "$USER_NAME")'
         'opts="credentials=/root/.smb-aicage,uid=$uid,gid=$gid,vers=3.1.1,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount"'
@@ -200,7 +213,7 @@ function New-AicUserData {
     $y.Add("timezone: $(& $q $TimeZone)")
     $y.Add('users:')
     $y.Add("  - name: $(& $q $State.User)")
-    $y.Add("    gecos: 'AI Cage user'")
+    $y.Add("    gecos: 'Terrarium user'")
     $y.Add('    groups: [sudo, adm]')
     $y.Add('    shell: /bin/bash')
     if ($PasswordlessSudo) { $y.Add("    sudo: 'ALL=(ALL) NOPASSWD:ALL'") }
@@ -243,7 +256,7 @@ function New-AicUserData {
     }
     $y.Add('runcmd:')
     $y.Add('  - [bash, /usr/local/sbin/aicage-firstboot.sh]')
-    $y.Add("final_message: 'AI Cage: cloud-init finished after `$UPTIME seconds'")
+    $y.Add("final_message: 'Terrarium: cloud-init finished after `$UPTIME seconds'")
     return ($y -join "`n") + "`n"
 }
 
@@ -296,13 +309,13 @@ function New-AicSeedIso {
 # Defaults. Override any of them in config.json, e.g. { "SubnetBase": "192.168.252" }; it is read
 # from <your home>\.aicage and from the tool folder (the tool folder wins).
 # The subnet differs from the manual setup guide (192.168.250.x) so both can live side by side.
-# Two places can hold VMs: <your home>\.aicage ("Home", also AI Cage's own logs, image cache and
+# Two places can hold VMs: <your home>\.aicage ("Home", also Terrarium's own logs, image cache and
 # settings) and the program folder ("Program"). Each VM is in one of them, chosen when it is
-# made; AI Cage looks in both. Root is the Home place ("Root" in config.json overrides it).
+# made; Terrarium looks in both. Root is the Home place ("Root" in config.json overrides it).
 
-$script:AicVersion = '0.3.0'
+$script:AicVersion = '0.4.0'
 
-# AiCage.ps1 (the single-file build) passes the tool folder as $AicToolRoot; the module form
+# Terrarium.ps1 (the single-file build) passes the tool folder as $AicToolRoot; the module form
 # (development) finds it as the parent of the module folder.
 $script:AicToolRootValue = Get-Variable -Name AicToolRoot -ValueOnly -ErrorAction SilentlyContinue
 if (-not $script:AicToolRootValue) { $script:AicToolRootValue = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
@@ -325,7 +338,7 @@ $script:AicConfigCache = $null
 function Get-AicConfig {
     <#
     .SYNOPSIS
-    Shows the settings AI Cage uses (defaults merged with <Root>\config.json).
+    Shows the settings Terrarium uses (defaults merged with <Root>\config.json).
     #>
     [CmdletBinding()]
     param()
@@ -368,7 +381,7 @@ function Get-AicStateLocation($State) {
 
 # Layout of each place: <place>\logs and <place>\data\{images,keys,ssh,vms,shared,network.json}.
 # Per VM (in the VM's place): vms\<name>, keys\<name>, ssh\known_hosts, shared\<name>.
-# AI Cage's own (always Home): logs, images, network.json, settings.json, ssh\config.
+# Terrarium's own (always Home): logs, images, network.json, settings.json, ssh\config.
 $script:AicDataDirs = @{ Vms = 'vms'; Images = 'images'; Keys = 'keys'; Ssh = 'ssh'; Shared = 'shared' }
 
 function Get-AicPath {
@@ -464,7 +477,7 @@ function Get-AicState1 {
     # Like Get-AicState but fails with a clear message when the VM is unknown.
     param([Parameter(Mandatory)][string]$Name)
     $s = Get-AicState -Name $Name
-    if (-not $s) { throw "No AI Cage VM named '$Name'. Get-AicVm lists them." }
+    if (-not $s) { throw "No Terrarium VM named '$Name'. Get-AicVm lists them." }
     return $s
 }
 
@@ -504,7 +517,7 @@ function ConvertFrom-AicSecureString([Security.SecureString]$Secure) {
 function Move-AicOldLayout {
     # 0.2 kept images, keys, ssh, vms, shared and network.json directly in the program folder;
     # they now live in its data folder. Moved once, as Administrator (the folders are locked to
-    # Administrators). Then AI Cage's own files of 0.3 move from there to Home.
+    # Administrators). Then Terrarium's own files of 0.3 move from there to Home.
     $root = Get-AicLocationRoot Program
     $data = Join-Path $root 'data'
     foreach ($kind in @($script:AicDataDirs.get_Keys())) {   # not .Keys: one entry is named Keys
@@ -536,7 +549,7 @@ function Move-AicOldLayout {
     $marker = Join-Path $root '.acl-set'          # left by 0.1
     if (Test-Path -LiteralPath $marker) { Remove-Item -LiteralPath $marker -Force }
 
-    # 0.3 kept everything in the program folder. Its VMs stay there (the Program place); AI Cage's
+    # 0.3 kept everything in the program folder. Its VMs stay there (the Program place); Terrarium's
     # own files move to Home, unless Home already has them.
     if ((Get-AicLocations) -notcontains 'Program' -or -not (Test-Path -LiteralPath $data)) { return }
     foreach ($item in 'images', 'network.json', 'settings.json') {
@@ -696,7 +709,7 @@ function Start-AicLog {
     $script:AicLogFile = Join-Path (Get-AicPath Logs) "$stamp-$Operation.log"
     $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
     $osText = if ($os) { '{0} {1} (build {2})' -f $os.Caption, $os.OSArchitecture, $os.BuildNumber } else { 'unknown' }
-    Write-AicLog "AI Cage $script:AicVersion - $Operation" -Level Info
+    Write-AicLog "Terrarium $script:AicVersion - $Operation" -Level Info
     Write-AicLog "Windows: $osText; PowerShell $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)" -Level Debug
     Write-AicLog "Log file: $script:AicLogFile" -Level Debug
 
@@ -1207,8 +1220,8 @@ function Initialize-AicHostNetwork {
                 Write-AicLog "Windows allows only one NAT here and '$($o.Name)' ($($o.InternalIPInterfaceAddressPrefix)) exists." -Level Error
                 $hint = Get-AicReuseHint -Nat $o
                 if ($hint) {
-                    Write-AicLog "AI Cage can share that network instead:" -Level Warn
-                    Write-AicLog "  1. Remove-AicHostNetwork   (removes only the '$($cfg.SwitchName)' switch AI Cage just made)" -Level Warn
+                    Write-AicLog "Terrarium can share that network instead:" -Level Warn
+                    Write-AicLog "  1. Remove-AicHostNetwork   (removes only the '$($cfg.SwitchName)' switch Terrarium just made)" -Level Warn
                     Write-AicLog "  2. create $(Get-AicUserConfigPath) containing:  $hint" -Level Warn
                     Write-AicLog "  3. New-AicVm again" -Level Warn
                 }
@@ -1233,13 +1246,13 @@ function New-AicBlockRules {
     $fw = Get-AicBlockRuleName $Prefix
     if (-not (Get-NetFirewallRule -Name "$fw-TCP" -ErrorAction SilentlyContinue)) {
         Write-AicLog "New-NetFirewallRule $fw-TCP: block inbound TCP from $Prefix except port 445" -Level Cmd
-        New-NetFirewallRule -Name "$fw-TCP" -DisplayName "AI Cage - block VMs ($Prefix), TCP except 445" -Group 'AI Cage' `
+        New-NetFirewallRule -Name "$fw-TCP" -DisplayName "Terrarium - block VMs ($Prefix), TCP except 445" -Group 'Terrarium' `
             -Direction Inbound -Action Block -Protocol TCP -LocalPort '1-444', '446-65535' -RemoteAddress $Prefix -Profile Any | Out-Null
         Add-AicCreatedNetwork -Kind Firewall -Name "$fw-TCP"
     }
     if (-not (Get-NetFirewallRule -Name "$fw-UDP" -ErrorAction SilentlyContinue)) {
         Write-AicLog "New-NetFirewallRule $fw-UDP: block all inbound UDP from $Prefix" -Level Cmd
-        New-NetFirewallRule -Name "$fw-UDP" -DisplayName "AI Cage - block VMs ($Prefix), UDP" -Group 'AI Cage' `
+        New-NetFirewallRule -Name "$fw-UDP" -DisplayName "Terrarium - block VMs ($Prefix), UDP" -Group 'Terrarium' `
             -Direction Inbound -Action Block -Protocol UDP -RemoteAddress $Prefix -Profile Any | Out-Null
         Add-AicCreatedNetwork -Kind Firewall -Name "$fw-UDP"
     }
@@ -1253,7 +1266,7 @@ function Test-AicBlockRules([string]$Prefix) {
 function Protect-AicNetwork {
     <#
     .SYNOPSIS
-    Adds the AI Cage firewall block rules for another VM network, e.g. the manual guide's
+    Adds the Terrarium firewall block rules for another VM network, e.g. the manual guide's
     192.168.250.0/24: its VMs then reach only the laptop's shared-folder port (TCP 445).
     .NOTES
     Remove-AicHostNetwork removes these rules again.
@@ -1267,7 +1280,7 @@ function Protect-AicNetwork {
 }
 
 function Get-AicReuseHint {
-    # config.json content that makes AI Cage use an existing NAT network (e.g. the manual setup's).
+    # config.json content that makes Terrarium use an existing NAT network (e.g. the manual setup's).
     param([Parameter(Mandatory)]$Nat)
     $parts = "$($Nat.InternalIPInterfaceAddressPrefix)".Split('/')
     if ($parts.Count -ne 2 -or $parts[1] -ne '24') { return $null }
@@ -1279,7 +1292,7 @@ function Get-AicReuseHint {
     return (@{ SubnetBase = $base; SwitchName = $switch; NatName = $Nat.Name; FirstVmHost = 20 } | ConvertTo-Json -Compress)
 }
 
-# Only what AI Cage created itself is ever removed: <Root>\data\network.json records it, so a
+# Only what Terrarium created itself is ever removed: <Root>\data\network.json records it, so a
 # shared network (e.g. the manual guide's, via config.json) is never touched.
 function Get-AicCreatedNetwork {
     $p = Join-Path (Get-AicPath Data) 'network.json'
@@ -1303,18 +1316,18 @@ function Add-AicCreatedNetwork([ValidateSet('Switch', 'Nat', 'Firewall')][string
 function Remove-AicHostNetwork {
     <#
     .SYNOPSIS
-    Removes the virtual switch and NAT that AI Cage created (only when no AI Cage VM is left).
-    A network AI Cage did not create is never removed.
+    Removes the virtual switch and NAT that Terrarium created (only when no Terrarium VM is left).
+    A network Terrarium did not create is never removed.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param([switch]$Force)
-    if (@(Get-AicState).Count -gt 0 -and -not $Force) { throw 'AI Cage VMs still exist. Remove them first (or use -Force).' }
+    if (@(Get-AicState).Count -gt 0 -and -not $Force) { throw 'Terrarium VMs still exist. Remove them first (or use -Force).' }
     $made = Get-AicCreatedNetwork
     $nats = @(Get-AicCreatedList $made 'Nat'); $switches = @(Get-AicCreatedList $made 'Switch'); $rules = @(Get-AicCreatedList $made 'Firewall')
-    if (-not ($nats + $switches + $rules)) { Write-Host 'AI Cage created no switch, NAT or firewall rule - nothing to remove.'; return }
+    if (-not ($nats + $switches + $rules)) { Write-Host 'Terrarium created no switch, NAT or firewall rule - nothing to remove.'; return }
     if (-not $PSCmdlet.ShouldProcess("switch $($switches -join ', ') and NAT $($nats -join ', ')", 'Remove')) { return }
     Start-AicLog 'remove-network'
-    Invoke-AicStep 'Remove NAT, virtual switch and firewall rules created by AI Cage' {
+    Invoke-AicStep 'Remove NAT, virtual switch and firewall rules created by Terrarium' {
         foreach ($rn in $rules) {
             $r = Get-NetFirewallRule -Name $rn -ErrorAction SilentlyContinue
             if ($r) { Write-AicLog "Remove-NetFirewallRule $rn" -Level Cmd; $r | Remove-NetFirewallRule }
@@ -1352,6 +1365,114 @@ function Set-AicIsolation {
     }
 }
 
+# ---- Private/Ports.ps1 ----------------------------------------------------------------
+# Port forwards, laptop -> VM: Windows' own port proxy (netsh interface portproxy, run by the IP
+# Helper service) listens on the laptop's loopback only - 127.0.0.1 and ::1 - so apps on this
+# laptop reach e.g. a Docker container in the VM as localhost:8080, and the local network does
+# not. TCP only. Windows keeps the forwards across restarts. Even without a forward the laptop
+# reaches the VM's ports directly at http://<VM address>:<port>; the VM still reaches nothing of
+# the laptop (the direction VM -> laptop stays blocked by the firewall rules above).
+
+$script:AicPortProxyKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\PortProxy'
+
+function ConvertTo-AicPortList {
+    <#
+    .SYNOPSIS
+    Checks and normalizes port forwards: '8080', '3000:80' (laptop:VM) or '8080, 3000:80'.
+    Returns 'laptop:vm' strings.
+    #>
+    param([AllowEmptyCollection()][string[]]$Ports)
+    $out = @()
+    foreach ($p in @($Ports | ForEach-Object { "$_" -split '[\s,;]+' } | Where-Object { $_ })) {
+        if ($p -notmatch '^(\d{1,5})(?::(\d{1,5}))?$') { throw "Port '$p': use a number (8080) or laptop:VM (3000:80)." }
+        $h = [int]$Matches[1]
+        $v = if ($Matches[2]) { [int]$Matches[2] } else { $h }
+        if ($h -lt 1 -or $h -gt 65535 -or $v -lt 1 -or $v -gt 65535) { throw "Port '$p': numbers from 1 to 65535." }
+        $out += "${h}:$v"
+    }
+    $dup = @($out | ForEach-Object { $_.Split(':')[0] } | Group-Object | Where-Object Count -gt 1 | ForEach-Object Name)
+    if ($dup.Count) { throw "Laptop port $($dup -join ', ') is listed twice." }
+    return $out      # callers wrap it in @(): one port comes back as a plain string
+}
+
+function Get-AicPortForward($State) {
+    if ($State.PSObject.Properties['Ports'] -and $State.Ports) { return @($State.Ports) }
+    return @()
+}
+
+function Get-AicPortProxy {
+    # Every port proxy entry on the laptop (not only ours), read from the registry, where netsh
+    # keeps them as "<listen address>/<port>" = "<connect address>/<port>".
+    foreach ($kind in 'v4tov4', 'v6tov4') {
+        $key = Join-Path $script:AicPortProxyKey "$kind\tcp"
+        if (-not (Test-Path -LiteralPath $key)) { continue }
+        $item = Get-Item -LiteralPath $key
+        foreach ($n in $item.GetValueNames()) {
+            $l = $n.Split('/'); $c = "$($item.GetValue($n))".Split('/')
+            if ($l.Count -ne 2 -or $c.Count -ne 2) { continue }
+            [pscustomobject]@{ Kind = $kind; ListenAddress = $l[0]; ListenPort = $l[1]; ConnectAddress = $c[0]; ConnectPort = $c[1] }
+        }
+    }
+}
+
+function Remove-AicPortProxy {
+    param([Parameter(Mandatory)]$Entry)
+    Invoke-AicNative -FilePath 'netsh.exe' -ArgumentList @('interface', 'portproxy', 'delete', $Entry.Kind,
+        "listenaddress=$($Entry.ListenAddress)", "listenport=$($Entry.ListenPort)") | Out-Null
+}
+
+function Get-AicPortConflict {
+    # Why some of these laptop ports cannot be forwarded to VM $Name (empty: all fine).
+    param([Parameter(Mandatory)][string]$Name, [string[]]$Ports, [string]$Ip)
+    $msgs = @()
+    $mine = @(Get-AicPortProxy | Where-Object { $Ip -and $_.ConnectAddress -eq $Ip } | ForEach-Object { $_.ListenPort })
+    $others = @(Get-AicState | Where-Object { $_.Name -ne $Name })
+    foreach ($f in $Ports) {
+        $h = $f.Split(':')[0]
+        $o = $others | Where-Object { @(Get-AicPortForward $_ | ForEach-Object { $_.Split(':')[0] }) -contains $h } | Select-Object -First 1
+        if ($o) { $msgs += "laptop port $h already goes to VM $($o.Name)"; continue }
+        if ($mine -contains $h) { continue }
+        $busy = Get-NetTCPConnection -State Listen -LocalPort ([int]$h) -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::1', '::' } | Select-Object -First 1
+        if ($busy) {
+            $prog = (Get-Process -Id $busy.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+            $msgs += "laptop port $h is already used by $(if ($prog) { $prog } else { "process $($busy.OwningProcess)" })"
+        }
+    }
+    return $msgs
+}
+
+function Set-AicPortForward {
+    # Makes the port proxy match the VM's Ports list.
+    param([Parameter(Mandatory)]$State)
+    $want = @(Get-AicPortForward $State)
+    $bad = @(Get-AicPortConflict -Name $State.Name -Ports $want -Ip $State.Ip)
+    if ($bad.Count) { throw "Cannot forward: $($bad -join '; ')." }
+    foreach ($e in @(Get-AicPortProxy | Where-Object { $_.ConnectAddress -eq $State.Ip })) { Remove-AicPortProxy -Entry $e }
+    if (-not $want.Count) { Write-AicLog 'No port forwards' -Level Debug; return }
+
+    $svc = Get-Service iphlpsvc -ErrorAction SilentlyContinue
+    if (-not $svc) { throw 'The IP Helper service (iphlpsvc), which forwards the ports, is missing on this laptop.' }
+    if ("$($svc.StartType)" -eq 'Disabled') { Write-AicLog 'Set-Service iphlpsvc -StartupType Automatic' -Level Cmd; Set-Service iphlpsvc -StartupType Automatic }
+    if ($svc.Status -ne 'Running') { Write-AicLog 'Start-Service iphlpsvc (IP Helper, forwards the ports)' -Level Cmd; Start-Service iphlpsvc }
+
+    foreach ($f in $want) {
+        $h, $v = $f.Split(':')
+        foreach ($pair in @(@('v4tov4', '127.0.0.1'), @('v6tov4', '::1'))) {
+            Invoke-AicNative -FilePath 'netsh.exe' -ArgumentList @('interface', 'portproxy', 'add', $pair[0],
+                "listenaddress=$($pair[1])", "listenport=$h", "connectaddress=$($State.Ip)", "connectport=$v") | Out-Null
+        }
+        Write-AicLog "localhost:$h on this laptop -> $($State.Name) port $v" -Level Info
+    }
+    Start-Sleep -Seconds 1
+    foreach ($f in $want) {
+        $h = $f.Split(':')[0]
+        if (-not (Get-NetTCPConnection -State Listen -LocalPort ([int]$h) -LocalAddress 127.0.0.1 -ErrorAction SilentlyContinue)) {
+            Write-AicLog "Windows does not listen on localhost:$h yet. If it stays so: Restart-Service iphlpsvc" -Level Warn
+        }
+    }
+}
+
 # ---- Private/Share.ps1 ----------------------------------------------------------------
 # Shared folder: a locked-down local account per VM that can open only that VM's share.
 
@@ -1382,7 +1503,7 @@ function New-AicShare {
     } else {
         Write-AicLog "New-LocalUser -Name $acct -PasswordNeverExpires -UserMayNotChangePassword (random password)" -Level Cmd
         New-LocalUser -Name $acct -Password (ConvertTo-SecureString $pw -AsPlainText -Force) -PasswordNeverExpires `
-            -UserMayNotChangePassword -AccountNeverExpires -Description "AI Cage: share for VM $($State.Name), no logon" | Out-Null
+            -UserMayNotChangePassword -AccountNeverExpires -Description "Terrarium: share for VM $($State.Name), no logon" | Out-Null
     }
     $user = Get-LocalUser -Name $acct
     $sid = $user.SID.Value
@@ -1418,10 +1539,10 @@ function Publish-AicShare {
     $full = "$env:COMPUTERNAME\$acct"
     if ($State.SharedReadOnly) {
         Write-AicLog "New-SmbShare -Name $($State.ShareName) -Path '$folder' -ReadAccess $full" -Level Cmd
-        New-SmbShare -Name $State.ShareName -Path $folder -ReadAccess $full -CachingMode None -Description "AI Cage VM $($State.Name)" | Out-Null
+        New-SmbShare -Name $State.ShareName -Path $folder -ReadAccess $full -CachingMode None -Description "Terrarium VM $($State.Name)" | Out-Null
     } else {
         Write-AicLog "New-SmbShare -Name $($State.ShareName) -Path '$folder' -ChangeAccess $full" -Level Cmd
-        New-SmbShare -Name $State.ShareName -Path $folder -ChangeAccess $full -CachingMode None -Description "AI Cage VM $($State.Name)" | Out-Null
+        New-SmbShare -Name $State.ShareName -Path $folder -ChangeAccess $full -CachingMode None -Description "Terrarium VM $($State.Name)" | Out-Null
     }
     # Only our account may use the share (Windows sometimes adds Everyone).
     Get-SmbShareAccess -Name $State.ShareName | Where-Object { $_.AccountName -ne $full } | ForEach-Object {
@@ -1468,7 +1589,7 @@ function New-AicShareFirewallRule {
     $ruleName = "AICage-SMB-$($State.Name)"
     Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
     Write-AicLog "New-NetFirewallRule TCP 445 from $($State.Ip) to $(Get-AicHostIp) only" -Level Cmd
-    New-NetFirewallRule -Name $ruleName -DisplayName "AI Cage - share for VM $($State.Name)" -Group 'AI Cage' `
+    New-NetFirewallRule -Name $ruleName -DisplayName "Terrarium - share for VM $($State.Name)" -Group 'Terrarium' `
         -Direction Inbound -Action Allow -Protocol TCP -LocalPort 445 -LocalAddress (Get-AicHostIp) `
         -RemoteAddress $State.Ip -Profile Any | Out-Null
 }
@@ -1587,7 +1708,7 @@ function Remove-AicKnownHost {
 function Update-AicSshConfig {
     # <Root>\ssh\config lists every VM, so "ssh -F C:\AICage\ssh\config <name>" works by hand too.
     $cfgPath = Join-Path (Get-AicPath Ssh) 'config'
-    $lines = @('# Generated by AI Cage - changes are overwritten.')
+    $lines = @('# Generated by Terrarium - changes are overwritten.')
     foreach ($s in @(Get-AicState)) {
         $lines += "Host $($s.Name)"
         $lines += "  HostName $($s.Ip)"
@@ -1643,7 +1764,7 @@ function Write-AicSshField([IO.Stream]$Stream, [byte[]]$Bytes) {
 
 function ConvertTo-AicPpk {
     # PuTTY cannot read OpenSSH key files. Writes <key>.ppk (PuTTY key format 2, no passphrase)
-    # from the ed25519 key AI Cage made, so PuTTY logs in without a password too.
+    # from the ed25519 key Terrarium made, so PuTTY logs in without a password too.
     param([Parameter(Mandatory)][string]$KeyPath)
     $ppk = "$KeyPath.ppk"
     if ((Test-Path -LiteralPath $ppk) -and (Get-Item -LiteralPath $ppk).LastWriteTimeUtc -ge (Get-Item -LiteralPath $KeyPath).LastWriteTimeUtc) { return $ppk }
@@ -1728,20 +1849,41 @@ function Start-AicPutty {
 }
 
 # ---- Public/Host.ps1 ------------------------------------------------------------------
+# ---- Remote Desktop -------------------------------------------------------------------------
+# The VM's desktop (xrdp) in Windows' Remote Desktop, with a .rdp file that shares nothing of
+# this laptop: no drives, printers, devices - and no clipboard, which often holds passwords.
+# (Set redirectclipboard:i:1 in the file if you want copy and paste.)
+
+function Start-AicDesktop {
+    param([Parameter(Mandatory)]$State)
+    $rdp = Join-Path (Split-Path (Get-AicStatePath -Name $State.Name -Location (Get-AicStateLocation $State))) "$($State.Name).rdp"
+    if (-not (Test-Path -LiteralPath $rdp)) {
+        $lines = @(
+            "full address:s:$($State.Ip)", "username:s:$($State.User)", 'screen mode id:i:1', 'smart sizing:i:1', 'dynamic resolution:i:1'
+            'authentication level:i:0', 'enablecredsspsupport:i:0', 'prompt for credentials:i:0'
+            'redirectclipboard:i:0', 'redirectprinters:i:0', 'redirectdrives:i:0', 'drivestoredirect:s:', 'redirectcomports:i:0'
+            'redirectsmartcards:i:0', 'devicestoredirect:s:', 'camerastoredirect:s:', 'audiomode:i:0', 'audiocapturemode:i:0'
+        )
+        Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
+    }
+    Write-AicLog "mstsc.exe $rdp  (log in as $($State.User) with your Linux password)" -Level Debug
+    Start-Process -FilePath 'mstsc.exe' -ArgumentList "`"$rdp`""
+}
+
 function Test-AicAdmin {
     $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Assert-AicReady {
-    if (-not (Test-AicAdmin)) { throw 'Run PowerShell as Administrator (right-click -> Run as administrator), or start AiCage.cmd.' }
+    if (-not (Test-AicAdmin)) { throw 'Run PowerShell as Administrator (right-click -> Run as administrator), or start Terrarium.cmd.' }
     if (-not (Get-Module -ListAvailable -Name Hyper-V)) { throw 'The Hyper-V PowerShell module is missing. Run Test-AicHost for details.' }
 }
 
 function Test-AicHost {
     <#
     .SYNOPSIS
-    Checks whether this laptop can run AI Cage VMs and prints what to fix.
+    Checks whether this laptop can run Terrarium VMs and prints what to fix.
     #>
     [CmdletBinding()]
     param()
@@ -1815,7 +1957,7 @@ function Test-AicHost {
     foreach ($n in @(Get-NetNat -ErrorAction SilentlyContinue)) {
         $pfx = "$($n.InternalIPInterfaceAddressPrefix)"
         if ($n.Name -eq $cfg.NatName) { Add-Check 'NAT' PASS "$($n.Name) $pfx" }
-        elseif (Test-AicBlockRules $pfx) { Add-Check 'Other VM network' PASS "$($n.Name) $pfx - protected by AI Cage firewall rules" }
+        elseif (Test-AicBlockRules $pfx) { Add-Check 'Other VM network' PASS "$($n.Name) $pfx - protected by Terrarium firewall rules" }
         else {
             Add-Check 'Other VM network' WARN "$($n.Name) $pfx (e.g. the manual setup, Docker): its VMs can reach laptop services such as RPC and NetBIOS. Protecting it leaves them only the shared folder (TCP 445)." "Protect-AicNetwork -Prefix '$pfx' -Confirm:`$false"
         }
@@ -1832,7 +1974,7 @@ function Test-AicHost {
 
     $failed = @($results | Where-Object Status -eq 'FAIL').Count
     if ($failed) { Write-AicLog "$failed check(s) failed - see above." -Level Error }
-    else { Write-AicLog 'This laptop is ready for AI Cage.' -Level Ok }
+    else { Write-AicLog 'This laptop is ready for Terrarium.' -Level Ok }
     Write-AicLog "Log: $(Get-AicLogPath)" -Level Info
     return $results
 }
@@ -1858,7 +2000,7 @@ function Show-AiCage {
     .SYNOPSIS
     Prints the quick-start command list.
     #>
-    Write-Host "AI Cage $script:AicVersion - isolated Debian VMs on Hyper-V" -ForegroundColor Cyan
+    Write-Host "Terrarium $script:AicVersion - the AI cage: isolated Debian VMs on Hyper-V" -ForegroundColor Cyan
     Write-Host @'
 
   Test-AicHost                     check this laptop (run first)
@@ -1866,11 +2008,14 @@ function Show-AiCage {
   New-AicVm -Name agent1           create a VM (asks for the Linux password)
   Get-AicVm                        list VMs: state, address, memory
   Connect-AicVm agent1             open an SSH terminal into the VM
-  Connect-AicVm agent1 -With PuTTY the same in PuTTY
+  Connect-AicVm agent1 -With PuTTY the same in PuTTY (-With Desktop: the graphical desktop)
   Test-AicVm agent1                check the isolation from inside the VM
+  Debug-AicVm agent1               why the VM does not answer (or did not, before a restart)
   Set-AicVm agent1 -MemoryMaxMB 3072 -AutoStart $false
   Set-AicVm agent1 -SharedFolder D:\Work\agent1   change the shared folder
-  Start-AicVm / Stop-AicVm agent1
+  Set-AicVm agent1 -Ports 8080,3000:80   localhost:8080 on this laptop -> port 8080 in the VM
+  Install-AicTool agent1 -Tool Desktop   add Docker, ClaudeCode, Codex or Desktop later
+  Start-AicVm / Stop-AicVm / Restart-AicVm agent1   (Restart-AicVm -Force: hard reset)
   Move-AicVm agent1 -To Home       move the VM to your user folder (-To Program: back)
   Remove-AicVm agent1              delete the VM and everything made for it
   Get-AicLogPath                   the log file to send when something fails
@@ -1884,7 +2029,7 @@ function Test-AicVm {
     <#
     .SYNOPSIS
     Checks from inside the VM what it can and cannot reach (the manual guide's Step 11, automated).
-    If an isolation test fails, AI Cage repairs the host-side protection and tests again; if it
+    If an isolation test fails, Terrarium repairs the host-side protection and tests again; if it
     still fails, the VM is quarantined (network disconnected) until a later test passes.
     #>
     [CmdletBinding()]
@@ -1980,7 +2125,7 @@ function Invoke-AicIsolationTest {
         Write-AicLog "Laptop network: address $lanIp, router $gw ($($route.InterfaceAlias))" -Level Info
     } else { Write-AicLog 'No default route on the laptop - skipping router tests' -Level Warn }
 
-    # Every other VM we can find an address for, AI Cage or not.
+    # Every other VM we can find an address for, Terrarium or not.
     $others = @()
     foreach ($vm in Get-VM) {
         if ($vm.Name -eq $Name) { continue }
@@ -2045,7 +2190,7 @@ exit 0
 }
 
 # ---- Private/Tools.ps1 ----------------------------------------------------------------
-# Optional programs AI Cage installs into a new VM, after its first boot. Each one is a bash
+# Optional programs Terrarium installs into a new VM, after its first boot. Each one is a bash
 # script run over SSH as the VM's user (sudo where needed). What was installed is recorded in the
 # VM's aicage.json.
 
@@ -2079,6 +2224,20 @@ sudo install -m 0755 "$d/codex-$a-unknown-linux-musl" /usr/local/bin/codex
 rm -rf "$d"
 codex --version
 '@ }
+    # XFCE: a full desktop at a fraction of GNOME's or KDE's size (about 1 GB on disk, 400 MB
+    # of memory). It is opened with Remote Desktop (xrdp in the VM), which unlike the Hyper-V
+    # screen resizes with the window. The VM's screen keeps its text login.
+    Desktop    = @{ Title = 'Desktop (XFCE)'; Script = @'
+set -e
+sudo apt-get -o DPkg::Lock::Timeout=300 update -q
+sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends \
+  xfce4 xfce4-terminal xfce4-notifyd mousepad dbus-x11 at-spi2-core xrdp xorgxrdp firefox-esr
+sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true   # xrdp reads the TLS key
+echo xfce4-session > "$HOME/.xsession"
+sudo systemctl enable xrdp
+sudo systemctl restart xrdp
+systemctl is-active xrdp
+'@ }
 }
 
 function Get-AicInstalledTool($State) {
@@ -2105,6 +2264,28 @@ function Install-AicToolCore {
     return $failed
 }
 
+function Install-AicTool {
+    <#
+    .SYNOPSIS
+    Installs optional programs into an existing, running VM: Docker, ClaudeCode, Codex, Desktop.
+    .EXAMPLE
+    Install-AicTool agent1 -Tool Desktop
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)][string]$Name,
+          [Parameter(Mandatory)][ValidateSet('Docker', 'ClaudeCode', 'Codex', 'Desktop')][string[]]$Tool)
+    process {
+        Assert-AicReady
+        $s = Get-AicState1 -Name $Name
+        if ((Get-VM -Name $Name).State -ne 'Running') { throw "Start $Name first: programs are installed over SSH." }
+        Start-AicLog "install-$Name"
+        $failed = @(Install-AicToolCore -State $s -Tool $Tool)
+        if ($failed.Count) { throw "Not installed: $($failed -join ', ') - the log shows why." }
+        Write-AicLog "Installed in ${Name}: $(($Tool | ForEach-Object { $script:AicTools[$_].Title }) -join ', ')" -Level Ok
+        if ($Tool -contains 'Desktop') { Write-AicLog "Open it with the Desktop button (or: Connect-AicVm $Name -With Desktop); log in as $($s.User) with your Linux password." -Level Info }
+    }
+}
+
 # ---- Public/Vm.ps1 --------------------------------------------------------------------
 $script:AicBasePackages = @('hyperv-daemons', 'cifs-utils', 'locales', 'git', 'curl', 'ca-certificates', 'tmux', 'htop', 'unzip')
 $script:AicGuestServiceId = '6C09BB55-D683-4DA0-8931-C9BF705F6480'   # "Guest Service Interface"; its display name is localized
@@ -2123,7 +2304,7 @@ function New-AicVm {
         [ValidatePattern('^[a-z_][a-z0-9_-]{0,31}$')][string]$User = 'ai',
         [Security.SecureString]$Password,
         [ValidateRange(256, 65536)][int]$MemoryStartupMB = 1024,
-        [ValidateRange(128, 65536)][int]$MemoryMinMB = 512,
+        [ValidateRange(128, 65536)][int]$MemoryMinMB = 1024,
         [ValidateRange(256, 262144)][int]$MemoryMaxMB = 2048,
         [ValidateRange(1, 64)][int]$Cpu = 2,
         [ValidateRange(4, 2048)][int]$DiskGB = 30,
@@ -2134,7 +2315,8 @@ function New-AicVm {
         [string]$TimeZone,
         [string]$Keyboard,
         [string[]]$Packages = @(),
-        [ValidateSet('Docker', 'ClaudeCode', 'Codex')][string[]]$Tools = @(),
+        [ValidateSet('Docker', 'ClaudeCode', 'Codex', 'Desktop')][string[]]$Tools = @(),
+        [string[]]$Ports = @(),
         [ValidateSet('Home', 'Program')][string]$Location = 'Home',
         [string]$SetupScriptPath,
         [bool]$PasswordlessSudo = $true,
@@ -2149,8 +2331,11 @@ function New-AicVm {
     if ($User -in 'root', 'daemon', 'bin', 'sys', 'nobody', 'admin') { throw "User name '$User' is reserved." }
     $hostCpus = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
     if ($Cpu -gt $hostCpus) { throw "This laptop has $hostCpus logical processors; -Cpu $Cpu is too many." }
-    if (Get-AicState -Name $Name) { throw "AI Cage VM '$Name' already exists (Remove-AicVm $Name first)." }
-    if (Get-VM -Name $Name -ErrorAction SilentlyContinue) { throw "A Hyper-V VM named '$Name' already exists (not made by AI Cage)." }
+    if (Get-AicState -Name $Name) { throw "Terrarium VM '$Name' already exists (Remove-AicVm $Name first)." }
+    if (Get-VM -Name $Name -ErrorAction SilentlyContinue) { throw "A Hyper-V VM named '$Name' already exists (not made by Terrarium)." }
+    $Ports = @(ConvertTo-AicPortList $Ports)
+    $portProblems = @(Get-AicPortConflict -Name $Name -Ports $Ports)
+    if ($portProblems.Count) { throw "Ports: $($portProblems -join '; ')." }
 
     if (-not $Password) {
         $Password = Read-Host "Password for Linux user '$User' (used for sudo and PuTTY)" -AsSecureString
@@ -2249,7 +2434,7 @@ function New-AicVm {
             $startAction = if ($AutoStart) { 'Start' } else { 'Nothing' }
             Write-AicLog "Set-VM -AutomaticStartAction $startAction -AutomaticStartDelay 20 -AutomaticStopAction ShutDown -AutomaticCheckpointsEnabled `$false" -Level Cmd
             Set-VM -Name $Name -AutomaticStartAction $startAction -AutomaticStartDelay 20 -AutomaticStopAction ShutDown `
-                -AutomaticCheckpointsEnabled $false -Notes "Managed by AI Cage. Change it with Set-AicVm / Remove-AicVm."
+                -AutomaticCheckpointsEnabled $false -Notes "Managed by Terrarium. Change it with Set-AicVm / Remove-AicVm."
             Write-AicLog 'Set-VMNetworkAdapter -DhcpGuard On -RouterGuard On' -Level Cmd
             Set-VMNetworkAdapter -VMName $Name -DhcpGuard On -RouterGuard On
         }
@@ -2279,12 +2464,19 @@ function New-AicVm {
             if ($failedTools.Count) { Write-AicLog "Not installed: $($failedTools -join ', ') - the VM works without them; the log above shows why" -Level Warn }
         }
 
+        if ($Ports.Count) {
+            $state | Add-Member -NotePropertyName Ports -NotePropertyValue $Ports -Force
+            Save-AicState $state
+            try { Invoke-AicStep 'Port forwards to this laptop' { Set-AicPortForward -State $state } }
+            catch { Write-AicLog 'The VM works without them; Settings can try the ports again.' -Level Warn }
+        }
+
         # Shared folder and isolation, with automatic repair (and quarantine if that fails).
         $checks = Invoke-AicVmCheck -State $state
 
         Invoke-AicStep 'Checkpoint "fresh install"' {
-            Write-AicLog "Checkpoint-VM -Name $Name -SnapshotName 'AI Cage: fresh install'" -Level Cmd
-            Checkpoint-VM -Name $Name -SnapshotName 'AI Cage: fresh install'
+            Write-AicLog "Checkpoint-VM -Name $Name -SnapshotName 'Terrarium: fresh install'" -Level Cmd
+            Checkpoint-VM -Name $Name -SnapshotName 'Terrarium: fresh install'
         }
 
         $state.Status = 'ready'
@@ -2392,7 +2584,7 @@ function Test-AicShareRoundTrip {
 function Get-AicVm {
     <#
     .SYNOPSIS
-    Lists AI Cage VMs with their state, address, memory and settings.
+    Lists Terrarium VMs with their state, address, memory and settings.
     #>
     [CmdletBinding()]
     param([Parameter(Position = 0, ValueFromPipelineByPropertyName)][string]$Name)
@@ -2419,6 +2611,12 @@ function Get-AicVm {
                 Location     = Get-AicStateLocation $s
                 StoredIn     = Split-Path (Split-Path (Get-AicStatePath -Name $s.Name -Location (Get-AicStateLocation $s)))
                 Uptime       = if ($vm) { $vm.Uptime } else { $null }
+                # Heartbeat comes from the VM's kernel: LostCommunication or NoContact long after
+                # the start means the VM is stuck (no SSH, no keyboard on its screen).
+                Heartbeat    = if ($vm) { "$($vm.Heartbeat)" } else { '' }
+                MemoryDemandMB = if ($vm) { [int]($vm.MemoryDemand / 1MB) } else { 0 }
+                Tools        = @(Get-AicInstalledTool $s)
+                Ports        = @(Get-AicPortForward $s)
             }
         }
     }
@@ -2427,7 +2625,11 @@ function Get-AicVm {
 function Set-AicVm {
     <#
     .SYNOPSIS
-    Changes memory, processors, autostart, isolation or the shared folder of an AI Cage VM.
+    Changes memory, processors, autostart, isolation, the shared folder or the port forwards of a
+    Terrarium VM.
+    .PARAMETER Ports
+    Laptop ports forwarded to the VM, e.g. 8080, '3000:80' (laptop:VM). Apps on this laptop then
+    reach them as localhost:8080; the local network does not. @() removes all forwards.
     .NOTES
     Processor count and startup memory need the VM off; the rest works while it runs.
     #>
@@ -2441,7 +2643,8 @@ function Set-AicVm {
         [bool]$AutoStart,
         [ValidateSet('Strict', 'Open')][string]$Isolation,
         [string]$SharedFolder,
-        [bool]$SharedReadOnly
+        [bool]$SharedReadOnly,
+        [AllowEmptyCollection()][string[]]$Ports
     )
     process {
         Assert-AicReady
@@ -2484,6 +2687,12 @@ function Set-AicVm {
             if ($vm.State -ne 'Running' -and $ro -ne [bool]$s.SharedReadOnly) { throw 'Start the VM to switch read-only on or off.' }
             Invoke-AicStep "Shared folder: $folder$(if ($ro) { ' (read-only)' })" { Set-AicShareFolder -State $s -Folder $folder -ReadOnly $ro -Running ($vm.State -eq 'Running') }
         }
+        if ($PSBoundParameters.ContainsKey('Ports')) {
+            $list = @(ConvertTo-AicPortList $Ports)
+            $s | Add-Member -NotePropertyName Ports -NotePropertyValue $list -Force
+            Invoke-AicStep "Port forwards: $(if ($list.Count) { $list -join ', ' } else { 'none' })" { Set-AicPortForward -State $s }
+            Save-AicState $s
+        }
         Get-AicVm -Name $Name
     }
 }
@@ -2511,20 +2720,189 @@ function Stop-AicVm {
     }
 }
 
+function Restart-AicVm {
+    <#
+    .SYNOPSIS
+    Restarts a VM. -Force resets it like a power button, for a VM that no longer answers.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)][string]$Name, [switch]$Force)
+    process {
+        Assert-AicReady
+        $s = Get-AicState1 -Name $Name
+        Start-AicLog "restart-$Name"
+        Invoke-AicStep "Restart $Name$(if ($Force) { ' (hard reset)' })" {
+            if ((Get-VM -Name $Name).State -ne 'Off') {
+                if ($Force) { Write-AicLog "Stop-VM $Name -TurnOff" -Level Cmd; Stop-VM -Name $Name -TurnOff -Force }
+                else { Write-AicLog "Stop-VM $Name (clean shutdown)" -Level Cmd; Stop-VM -Name $Name -Force }
+            }
+            Write-AicLog "Start-VM $Name" -Level Cmd
+            Start-VM -Name $Name
+            Wait-AicSsh -State $s -TimeoutSeconds 180
+        }
+        Write-AicLog "$Name is up again. Diagnose now shows the log of the boot before the restart." -Level Ok
+    }
+}
+
+function Debug-AicVm {
+    <#
+    .SYNOPSIS
+    Finds out why a VM does not answer (no SSH, no keyboard on its screen), or why it did not
+    before its last restart: what Hyper-V sees (heartbeat, memory), Hyper-V's own events for the
+    VM and, when SSH works, the VM's system log of this and the previous boot.
+    .OUTPUTS
+    Name, Responding (SSH works) and Problems (short findings).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)][string]$Name)
+    process {
+        Assert-AicReady
+        $s = Get-AicState1 -Name $Name
+        Start-AicLog "diagnose-$Name"
+        $problems = New-Object System.Collections.Generic.List[string]
+        $vm = Get-VM -Name $Name
+
+        Invoke-AicStep 'What Hyper-V sees' {
+            $mem = Get-VMMemory -VMName $Name
+            $maxMb = [int]($mem.Maximum / 1MB); $wantMb = [int]($vm.MemoryDemand / 1MB)
+            Write-AicLog ('State {0}, running for {1}, heartbeat {2}, CPU {3}%' -f $vm.State, $vm.Uptime, $vm.Heartbeat, $vm.CPUUsage) -Level Info
+            Write-AicLog ('Memory: has {0} MB, wants {1} MB, may use {2}-{3} MB' -f [int]($vm.MemoryAssigned / 1MB), $wantMb, [int]($mem.Minimum / 1MB), $maxMb) -Level Info
+            if ($vm.State -ne 'Running') {
+                $problems.Add("The VM is $($vm.State), not running.")
+                if ("$($vm.State)" -like 'Paused*') { $problems.Add('Hyper-V pauses a VM when the laptop disk is full - free some space, then start it.') }
+            }
+            elseif ("$($vm.Heartbeat)" -in 'LostCommunication', 'NoContact', 'Error' -and $vm.Uptime.TotalMinutes -gt 3) {
+                $problems.Add("No heartbeat ($($vm.Heartbeat)): the VM's Linux kernel itself is stuck or completely overloaded.")
+            }
+            if ($vm.State -eq 'Running' -and $maxMb -and $wantMb -ge 0.95 * $maxMb) {
+                $problems.Add("Memory is full: the VM wants $wantMb MB and may use at most $maxMb MB. Raise 'at most' in Settings.")
+            }
+            $disk = Get-VMHardDiskDrive -VMName $Name | Select-Object -First 1
+            if ($disk) {
+                $drive = Get-PSDrive -Name $disk.Path.Substring(0, 1) -ErrorAction SilentlyContinue
+                if ($drive -and $drive.Free -lt 2GB) { $problems.Add(('Only {0:n1} GB free on {1}: where the VM disk lives.' -f ($drive.Free / 1GB), $drive.Name)) }
+            }
+        }
+
+        Invoke-AicStep 'Hyper-V events about this VM (last 7 days)' {
+            $since = (Get-Date).AddDays(-7)
+            $events = @(foreach ($log in 'Microsoft-Windows-Hyper-V-Worker-Admin', 'Microsoft-Windows-Hyper-V-VMMS-Admin') {
+                try {
+                    Get-WinEvent -FilterHashtable @{ LogName = $log; Level = 1, 2, 3; StartTime = $since } -MaxEvents 300 -ErrorAction Stop |
+                        Where-Object { $_.Message -like "*$($vm.Id)*" -or $_.Message -like "*'$Name'*" }
+                } catch { }   # "no events found" is an error too
+            })
+            $events = @($events | Sort-Object TimeCreated | Select-Object -Last 15)
+            foreach ($e in $events) {
+                $lvl = if ($e.Level -le 2) { 'Error' } else { 'Warn' }
+                Write-AicLog ('{0:yyyy-MM-dd HH:mm}  {1}' -f $e.TimeCreated, (($e.Message -split "`r?`n")[0])) -Level $lvl
+            }
+            if ($events.Count) { $problems.Add("Hyper-V logged $($events.Count) warning(s) or error(s) about the VM (in the log above).") }
+            else { Write-AicLog 'none' -Level Debug }
+        }
+
+        $responding = $false
+        if ($vm.State -eq 'Running') {
+            $responding = Invoke-AicStep 'SSH' {
+                if (-not (Test-AicTcpPort -Ip $s.Ip -Port 22 -TimeoutMs 3000)) {
+                    $problems.Add("SSH (port 22 on $($s.Ip)) does not answer at all.")
+                    return $false
+                }
+                if (-not (Test-AicSshReady -State $s)) {
+                    $problems.Add('SSH answers but the login does not finish: the VM is probably out of memory or overloaded.')
+                    return $false
+                }
+                Write-AicLog 'SSH works' -Level Ok
+                return $true
+            }
+        }
+
+        if ($responding) {
+            Invoke-AicStep "The VM's own log (this boot and the one before the last restart)" {
+                $script = @'
+J=journalctl; sudo -n true 2>/dev/null && J="sudo -n journalctl"
+echo "uptime: $(uptime)"
+free -m
+df -h / 2>/dev/null | tail -n 1 | awk '{print "disk /: " $3 " used of " $2 " (" $5 ")"}'
+df / 2>/dev/null | awk 'NR == 2 && $5 + 0 >= 95 { print "PROBLEM|The VM disk is full (" $5 "). Delete files, or e.g. docker system prune." }'
+echo "recent boots:"; $J --list-boots -q --no-pager 2>/dev/null | tail -n 3
+if [ ! -f /etc/systemd/journald.conf.d/terrarium.conf ] && sudo -n true 2>/dev/null; then
+  if [ ! -d /var/log/journal ]; then echo "PROBLEM|The system log was lost at every restart. It is kept from now on, so the next hang can be explained."; fi
+  sudo -n sh -c '__JOURNAL__' && echo "system log: now kept across restarts, written every 30 s"
+fi
+pat='out of memory|oom-kill|killed process|hung_task|blocked for more than|soft lockup|hard lockup|rcu.*stall|self-detected stall|i/o error|ext4-fs error|remounting filesystem read-only|call trace|watchdog'
+for b in -1 0; do
+  if [ $b = -1 ]; then w='previous boot'; else w='this boot'; fi
+  if ! $J -b $b -n 1 -q --no-pager >/dev/null 2>&1; then echo "== $w: no log kept"; continue; fi
+  echo "== $w"
+  hits=$($J -b $b -q --no-pager -o short-iso -p warning 2>/dev/null | grep -iE "$pat" | tail -n 15)
+  oom=$($J -b $b -q --no-pager 2>/dev/null | grep -ciE 'out of memory|oom-kill')
+  [ "${oom:-0}" -gt 0 ] && echo "PROBLEM|$w: $oom out-of-memory event(s). Give the VM more memory ('at most' in Settings)."
+  [ -n "$hits" ] && { echo "PROBLEM|$w: the kernel reported trouble (lines below)."; echo "$hits"; }
+done
+if $J -b -1 -n 1 -q --no-pager >/dev/null 2>&1; then
+  echo "== the last lines before the previous boot ended (a hang or a reset cuts them off):"
+  $J -b -1 -n 20 -q --no-pager -o short-iso 2>/dev/null
+  last=$($J -b -1 -n 1 -q --no-pager 2>/dev/null)
+  case "$last" in
+    *"Shutting down"*|*"Journal stopped"*|*"journald"*) ;;
+    *hv_balloon*) echo "PROBLEM|The previous boot ended abruptly right after Hyper-V took memory back from the VM (hv_balloon). Raise 'at least' memory in Settings to 1024 MB or more." ;;
+    *) echo "PROBLEM|The previous boot ended abruptly (no shutdown in its log): the VM froze or was reset. Its last lines are above." ;;
+  esac
+fi
+# Hyper-V's Dynamic Memory squeezing the VM down to its minimum.
+squeezed=$($J -b 0 -k -q --no-pager 2>/dev/null | grep -cE 'Balloon floor reached|Not enough memory')
+availmb=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+totalmb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+if [ "${squeezed:-0}" -gt 0 ] && [ "${availmb:-999}" -lt 200 ]; then
+  echo "PROBLEM|Hyper-V keeps taking memory back: the VM has $totalmb MB, only $availmb MB free. Raise 'at least' memory in Settings."
+fi
+failed=$(systemctl --failed --no-legend --plain --no-pager 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+[ -n "$failed" ] && echo "PROBLEM|Failed services: $failed"
+exit 0
+'@
+                $script = $script.Replace('__JOURNAL__', $script:AicJournalSetup.Replace("'", "'\''"))
+                foreach ($l in @(Invoke-AicSsh -State $s -Script $script -Quiet)) {
+                    if ($l -like 'PROBLEM|*') { $problems.Add($l.Substring(8)); Write-AicLog $l.Substring(8) -Level Warn }
+                    else { Write-AicLog $l -Level Guest }
+                }
+            }
+        }
+
+        if ($problems.Count) {
+            Write-AicLog "Found $($problems.Count) problem(s):" -Level Warn
+            foreach ($p in $problems) { Write-AicLog "  - $p" -Level Warn }
+        } else {
+            Write-AicLog 'No problem found. If the VM hung before a restart and the previous boot shows nothing, the hang left no trace in the VM.' -Level Ok
+        }
+        if (-not $responding -and $vm.State -eq 'Running') { Write-AicLog "A restart helps: Restart-AicVm $Name -Force (then Diagnose again to read the log of the stuck boot)." -Level Info }
+        Write-AicLog "Log: $(Get-AicLogPath)" -Level Info
+        return [pscustomobject]@{ Name = $Name; Responding = $responding; Running = ($vm.State -eq 'Running'); Problems = $problems.ToArray() }
+    }
+}
+
 function Connect-AicVm {
     <#
     .SYNOPSIS
     Opens a terminal window with an SSH session into the VM (key login, no password).
     .PARAMETER With
     Terminal (Windows' own ssh) or PuTTY. Without it, the choice made in the window is used
-    (kept in data\settings.json).
+    (kept in data\settings.json). Desktop opens the graphical desktop (Install-AicTool -Tool
+    Desktop) in Remote Desktop.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory, Position = 0, ValueFromPipelineByPropertyName)][string]$Name,
-          [ValidateSet('Terminal', 'PuTTY')][string]$With)
+          [ValidateSet('Terminal', 'PuTTY', 'Desktop')][string]$With)
     process {
         $s = Get-AicState1 -Name $Name
         if (-not $With) { $With = Get-AicSetting -Name TerminalProgram -Default 'Terminal' }
+        # A quick look first: a stuck VM otherwise just gives a terminal that closes at once.
+        $port = if ($With -eq 'Desktop') { 3389 } else { 22 }
+        if (-not (Test-AicTcpPort -Ip $s.Ip -Port $port -TimeoutMs 3000)) {
+            if ($With -eq 'Desktop' -and (Get-AicInstalledTool $s) -notcontains 'Desktop') { throw "$Name has no desktop yet: Settings -> Advanced -> Install -> Desktop." }
+            throw "$Name does not answer on port $port. Diagnose (Debug-AicVm $Name) shows why; a stuck VM needs a restart."
+        }
+        if ($With -eq 'Desktop') { Start-AicDesktop -State $s; return }
         if ($With -eq 'PuTTY') { Start-AicPutty -State $s; return }
         $cfg = Update-AicSshConfig
         Start-Process -FilePath (Get-AicSshExe) -ArgumentList "-F `"$cfg`" $Name"
@@ -2534,7 +2912,7 @@ function Connect-AicVm {
 function Remove-AicVm {
     <#
     .SYNOPSIS
-    Deletes an AI Cage VM and everything made for it: disk, checkpoints, share account, share,
+    Deletes a Terrarium VM and everything made for it: disk, checkpoints, share account, share,
     firewall rule, SSH key. The shared folder's files are kept unless -DeleteSharedFolder.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -2566,6 +2944,9 @@ function Remove-AicVm {
             } else { Write-AicLog 'no Hyper-V VM (already gone)' -Level Debug }
         }
         & $try 'Share, share account and firewall rule' { Remove-AicShare -State $s }
+        if ($s.Ip) {
+            & $try 'Port forwards' { foreach ($e in @(Get-AicPortProxy | Where-Object { $_.ConnectAddress -eq $s.Ip })) { Remove-AicPortProxy -Entry $e } }
+        }
         & $try 'SSH key and saved sessions' {
             if ($s.Ip) { Remove-AicKnownHost -State $s }
             $key = Get-AicKeyPath $s
@@ -2597,7 +2978,7 @@ function Remove-AicVm {
             if (-not (Test-Path -LiteralPath (Get-AicStatePath -Name $Name -Location (Get-AicStateLocation $s)))) { Save-AicState $s }
         } else { Write-AicLog "VM $Name removed." -Level Ok }
         if (@(Get-AicState).Count -eq 0) {
-            Write-AicLog 'No AI Cage VMs left. Remove-AicHostNetwork removes the virtual switch and NAT too.' -Level Info
+            Write-AicLog 'No Terrarium VMs left. Remove-AicHostNetwork removes the virtual switch and NAT too.' -Level Info
         }
     }
 }
@@ -2652,6 +3033,7 @@ function Move-AicVm {
             }
             Save-AicState $s
             Remove-Item -LiteralPath (Join-Path $oldDir 'aicage.json') -Force
+            Remove-Item -LiteralPath (Join-Path $oldDir "$Name.rdp") -Force -ErrorAction SilentlyContinue   # made again when needed
         }
         if (Test-Path -LiteralPath $oldDir) {
             if (@(Get-ChildItem -LiteralPath $oldDir -Recurse -File -Force).Count) { Write-AicLog "Some files stayed in $oldDir - look at them before deleting" -Level Warn }
@@ -2667,21 +3049,21 @@ function Move-AicVm {
 function Uninstall-AiCage {
     <#
     .SYNOPSIS
-    Removes all AI Cage VMs, the host network and the image cache. Shared folders are kept
+    Removes all Terrarium VMs, the host network and the image cache. Shared folders are kept
     unless -DeleteSharedFolders.
     #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param([switch]$DeleteSharedFolders)
     Assert-AicReady
-    if (-not $PSCmdlet.ShouldProcess('all AI Cage VMs, network and images', 'Remove')) { return }
+    if (-not $PSCmdlet.ShouldProcess('all Terrarium VMs, network and images', 'Remove')) { return }
     foreach ($s in @(Get-AicState)) { Remove-AicVm -Name $s.Name -DeleteSharedFolder:$DeleteSharedFolders -Force }
     Remove-AicHostNetwork -Force -Confirm:$false
     $img = Get-AicPath Images
     Remove-Item -LiteralPath $img -Recurse -Force
-    Write-AicLog "AI Cage removed. Logs stay in $(Get-AicPath Logs)." -Level Ok
+    Write-AicLog "Terrarium removed. Logs stay in $(Get-AicPath Logs)." -Level Ok
 }
 
-Export-ModuleMember -Function @('Test-AicHost', 'Enable-AicHyperV', 'New-AicVm', 'Remove-AicVm', 'Get-AicVm', 'Set-AicVm', 'Start-AicVm', 'Stop-AicVm', 'Connect-AicVm', 'Move-AicVm', 'Get-AicSetting', 'Set-AicSetting', 'Get-AicPuttyExe', 'Test-AicVm', 'Get-AicConfig', 'Get-AicLogPath', 'Remove-AicHostNetwork', 'Uninstall-AiCage', 'Protect-AicNetwork', 'Remove-AicLeftovers', 'Register-AicLogSink', 'Unregister-AicLogSink', 'Show-AiCage')
+Export-ModuleMember -Function @('Test-AicHost', 'Enable-AicHyperV', 'New-AicVm', 'Remove-AicVm', 'Get-AicVm', 'Set-AicVm', 'Start-AicVm', 'Stop-AicVm', 'Connect-AicVm', 'Move-AicVm', 'Get-AicSetting', 'Set-AicSetting', 'Get-AicPuttyExe', 'Test-AicVm', 'Get-AicConfig', 'Get-AicLogPath', 'Remove-AicHostNetwork', 'Uninstall-AiCage', 'Protect-AicNetwork', 'Remove-AicLeftovers', 'Install-AicTool', 'Restart-AicVm', 'Debug-AicVm', 'ConvertTo-AicPortList', 'Register-AicLogSink', 'Unregister-AicLogSink', 'Show-AiCage')
 }
 $AicModuleText = $AicModuleBlock.ToString()
 $AicLoader = 'New-Module -Name AiCage -ArgumentList $AicToolRoot -ScriptBlock ([scriptblock]::Create($AicModuleText)) | Import-Module -Force'
@@ -2695,14 +3077,14 @@ if ($Console) {
 # =============================================================================================
 # Part 2: the window
 # =============================================================================================
-# AI Cage - window for creating and managing the VMs. Started by AiCage.cmd (as Administrator).
+# Terrarium - window for creating and managing the VMs. Started by Terrarium.cmd (as Administrator).
 # The GUI is a thin layer: every action is an AiCage module command, run in a background
 # runspace so the window stays responsive, with its log lines streamed into the log panel.
 # ASCII only: Windows PowerShell 5.1 reads BOM-less files as ANSI.
 
 $ErrorActionPreference = 'Stop'
 # $AicLoader is the code that loads the AiCage commands, in this runspace and in the worker.
-# AiCage.ps1 (single-file build) sets it, together with $AicToolRoot and $AicModuleText.
+# Terrarium.ps1 (single-file build) sets it, together with $AicToolRoot and $AicModuleText.
 if (-not (Get-Variable -Name AicLoader -ErrorAction SilentlyContinue)) {
     $here = Split-Path -Parent $MyInvocation.MyCommand.Path      # the AiCage module folder
     $AicToolRoot = Split-Path $here -Parent
@@ -2712,7 +3094,7 @@ if (-not (Get-Variable -Name AicLoader -ErrorAction SilentlyContinue)) {
 
 function Show-Fatal([string]$Text) {
     try { Add-Content -LiteralPath (Join-Path $AicToolRoot 'logs\gui-crash.log') -Value ("{0} {1}" -f (Get-Date -Format s), $Text) } catch { }
-    [System.Windows.MessageBox]::Show($Text, 'AI Cage', 'OK', 'Error') | Out-Null
+    [System.Windows.MessageBox]::Show($Text, 'Terrarium', 'OK', 'Error') | Out-Null
 }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Windows.Forms
@@ -2721,11 +3103,11 @@ try {
     . ([scriptblock]::Create($AicLoader))
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Show-Fatal 'AI Cage needs Administrator rights. Start it with AiCage.cmd (it asks for them).'
+        Show-Fatal 'Terrarium needs Administrator rights. Start it with Terrarium.cmd (it asks for them).'
         return
     }
 } catch {
-    Show-Fatal "AI Cage could not start: $($_.Exception.Message)"
+    Show-Fatal "Terrarium could not start: $($_.Exception.Message)"
     return
 }
 
@@ -2736,7 +3118,7 @@ try {
 $mainXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="AI Cage" Width="1120" Height="740" MinWidth="820" MinHeight="520"
+        Title="Terrarium - the AI cage" Width="1180" Height="740" MinWidth="820" MinHeight="520"
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" FontSize="13" Background="#F5F6F8">
   <Window.Resources>
     <Style TargetType="Button">
@@ -2764,7 +3146,7 @@ $mainXaml = @'
     <DockPanel Grid.Row="0" Margin="0,0,0,10">
       <TextBlock x:Name="VersionText" DockPanel.Dock="Right" Foreground="#6B7280" VerticalAlignment="Bottom"/>
       <StackPanel>
-        <TextBlock Text="AI Cage" FontSize="22" FontWeight="SemiBold" Foreground="#111827"/>
+        <TextBlock FontSize="22" Foreground="#111827"><Run Text="Terrarium" FontWeight="SemiBold"/><Run Text="  the AI cage" Foreground="#6B7280" FontSize="15"/></TextBlock>
         <TextBlock Text="Isolated Debian VMs for AI agents: the internet yes, your files and your network no." Foreground="#6B7280"/>
       </StackPanel>
     </DockPanel>
@@ -2803,9 +3185,11 @@ $mainXaml = @'
             </ContextMenu>
           </Button.ContextMenu>
         </Button>
+        <Button x:Name="BtnDesktop" Content="Desktop" ToolTip="Open the VM's graphical desktop in Remote Desktop (install it under Settings - Advanced)"/>
         <Button x:Name="BtnFolder" Content="Shared folder" ToolTip="Open the VM's shared folder in Explorer"/>
         <Button x:Name="BtnScreen" Content="Screen" ToolTip="Show the VM's screen (Hyper-V console)"/>
         <Button x:Name="BtnTest" Content="Test and secure" ToolTip="Check what the VM can reach; repair or quarantine it if something is open"/>
+        <Button x:Name="BtnDiagnose" Content="Diagnose" ToolTip="Find out why the VM does not answer - or why it did not, before its last restart"/>
         <Button x:Name="BtnSettings" Content="Settings"/>
         <Button x:Name="BtnRemove" Content="Remove"/>
       </WrapPanel>
@@ -2829,6 +3213,7 @@ $mainXaml = @'
             <GridViewColumn Header="CPUs" Width="50" DisplayMemberBinding="{Binding Cpu}"/>
             <GridViewColumn Header="Starts with Windows" Width="130" DisplayMemberBinding="{Binding AutoStart}"/>
             <GridViewColumn Header="Network" Width="75" DisplayMemberBinding="{Binding Isolation}"/>
+            <GridViewColumn Header="Ports (localhost)" Width="110" DisplayMemberBinding="{Binding Ports}"/>
             <GridViewColumn Header="Shared folder" Width="260" DisplayMemberBinding="{Binding SharedFolder}"/>
             <GridViewColumn Header="Stored in" Width="200" DisplayMemberBinding="{Binding StoredIn}"/>
           </GridView>
@@ -2909,15 +3294,8 @@ $newXaml = @'
         <TextBlock Style="{StaticResource Hint}" Text="Lowercase letters, digits and dashes, up to 16 characters."/>
       </StackPanel>
 
-      <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
+      <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Shared folder"/>
       <StackPanel Grid.Row="2" Grid.Column="1">
-        <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
-        <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
-        <TextBlock Style="{StaticResource Hint}" Text="Where the VM's disk (a few GB), key and settings live. AI Cage finds VMs in both places."/>
-      </StackPanel>
-
-      <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Shared folder"/>
-      <StackPanel Grid.Row="4" Grid.Column="1">
         <DockPanel>
           <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
           <TextBox x:Name="FolderBox"/>
@@ -2926,51 +3304,47 @@ $newXaml = @'
         <TextBlock Style="{StaticResource Hint}" Text="The only folder of this laptop the VM can see (as ~/shared). Put nothing there the AI must not read."/>
       </StackPanel>
 
-      <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Linux user"/>
-      <TextBox Grid.Row="6" Grid.Column="1" x:Name="UserBox"/>
+      <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Linux user"/>
+      <TextBox Grid.Row="4" Grid.Column="1" x:Name="UserBox"/>
 
-      <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Password"/>
-      <StackPanel Grid.Row="8" Grid.Column="1">
+      <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Password"/>
+      <StackPanel Grid.Row="6" Grid.Column="1">
         <TextBox x:Name="PassBox"/>
-        <TextBlock Style="{StaticResource Hint}" Text="For sudo and PuTTY. The Terminal button logs in with a key, no password needed."/>
+        <TextBlock Style="{StaticResource Hint}" Text="For sudo, PuTTY and the Desktop. The Terminal button logs in with a key, no password needed."/>
       </StackPanel>
 
-      <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Memory (MB)"/>
-      <StackPanel Grid.Row="10" Grid.Column="1">
+      <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Memory (MB)"/>
+      <StackPanel Grid.Row="8" Grid.Column="1">
         <StackPanel Orientation="Horizontal">
           <TextBlock Text="at least" VerticalAlignment="Center" Margin="0,0,6,0"/>
           <ComboBox x:Name="MinMemBox" Width="90" IsEditable="True"/>
           <TextBlock Text="at most" VerticalAlignment="Center" Margin="14,0,6,0"/>
           <ComboBox x:Name="MaxMemBox" Width="90" IsEditable="True"/>
         </StackPanel>
-        <TextBlock Style="{StaticResource Hint}" Text="The VM takes only what it needs between the two (an idle VM uses about 150 MB)."/>
+        <TextBlock Style="{StaticResource Hint}" Text="The VM takes what it needs between the two. Below 1024 MB, Hyper-V may squeeze a busy VM until it freezes."/>
       </StackPanel>
 
-      <TextBlock Grid.Row="12" Style="{StaticResource Label}" Text="Processors / disk"/>
-      <StackPanel Grid.Row="12" Grid.Column="1" Orientation="Horizontal">
+      <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Processors / disk"/>
+      <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
         <ComboBox x:Name="CpuBox" Width="60"/>
         <TextBlock Text="CPUs" VerticalAlignment="Center" Margin="6,0,18,0"/>
         <ComboBox x:Name="DiskBox" Width="70" IsEditable="True"/>
         <TextBlock Text="GB disk (grows as needed)" VerticalAlignment="Center" Margin="6,0,0,0"/>
       </StackPanel>
 
-      <TextBlock Grid.Row="14" Style="{StaticResource Label}" Text="Startup"/>
-      <CheckBox Grid.Row="14" Grid.Column="1" x:Name="AutoBox" Content="Start automatically with Windows" VerticalAlignment="Center"/>
+      <TextBlock Grid.Row="12" Style="{StaticResource Label}" Text="Startup"/>
+      <CheckBox Grid.Row="12" Grid.Column="1" x:Name="AutoBox" Content="Start automatically with Windows" VerticalAlignment="Center"/>
 
-      <TextBlock Grid.Row="16" Style="{StaticResource Label}" Text="Network" VerticalAlignment="Top"/>
-      <StackPanel Grid.Row="16" Grid.Column="1">
+      <TextBlock Grid.Row="14" Style="{StaticResource Label}" Text="Network" VerticalAlignment="Top"/>
+      <StackPanel Grid.Row="14" Grid.Column="1">
         <RadioButton x:Name="StrictBox" GroupName="Iso" Content="Strict (recommended): internet only - no home, office or cowork network"/>
         <RadioButton x:Name="OpenBox" GroupName="Iso" Content="Open: the VM may also reach the local network" Margin="0,4,0,0"/>
       </StackPanel>
 
-      <TextBlock Grid.Row="18" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
-      <StackPanel Grid.Row="18" Grid.Column="1">
-          <WrapPanel>
-            <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,0"/>
-            <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,0"/>
-            <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,0"/>
-          </WrapPanel>
-        <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more)."/>
+      <TextBlock Grid.Row="16" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
+      <StackPanel Grid.Row="16" Grid.Column="1">
+        <TextBox x:Name="PortsBox"/>
+        <TextBlock Style="{StaticResource Hint}" Text="Optional, e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop then reach the VM's services (e.g. Docker containers) as localhost:8080; the local network does not. TCP only."/>
       </StackPanel>
     </Grid>
 
@@ -2984,28 +3358,46 @@ $newXaml = @'
           <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
           <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
           <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
           <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Extra packages"/>
+        <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
         <StackPanel Grid.Row="0" Grid.Column="1">
+          <WrapPanel>
+            <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,0"/>
+            <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,0"/>
+            <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,0"/>
+            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,18,0"/>
+          </WrapPanel>
+          <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more). Desktop: a light graphical desktop with Firefox, opened with the Desktop button (Remote Desktop); about 1 GB."/>
+        </StackPanel>
+        <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
+        <StackPanel Grid.Row="2" Grid.Column="1">
+          <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
+          <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
+          <TextBlock Style="{StaticResource Hint}" Text="Where the VM's disk (a few GB), key and settings live. Terrarium finds VMs in both places."/>
+        </StackPanel>
+        <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Extra packages"/>
+        <StackPanel Grid.Row="4" Grid.Column="1">
           <TextBox x:Name="PkgBox"/>
           <TextBlock Style="{StaticResource Hint}" Text="Debian packages, separated by spaces, e.g. nodejs npm python3-pip"/>
         </StackPanel>
-        <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Setup script"/>
-        <StackPanel Grid.Row="2" Grid.Column="1">
+        <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Setup script"/>
+        <StackPanel Grid.Row="6" Grid.Column="1">
           <DockPanel>
             <Button x:Name="BtnScript" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
             <TextBox x:Name="ScriptBox"/>
           </DockPanel>
           <TextBlock Style="{StaticResource Hint}" Text="Optional bash script, run once as root at the end of the first boot."/>
         </StackPanel>
-        <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Time zone"/>
-        <StackPanel Grid.Row="4" Grid.Column="1">
+        <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Time zone"/>
+        <StackPanel Grid.Row="8" Grid.Column="1">
           <TextBox x:Name="TzBox"/>
           <TextBlock Style="{StaticResource Hint}" Text="Empty: same as Windows. Otherwise e.g. Europe/Warsaw"/>
         </StackPanel>
-        <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Keyboard"/>
-        <StackPanel Grid.Row="6" Grid.Column="1">
+        <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Keyboard"/>
+        <StackPanel Grid.Row="10" Grid.Column="1">
           <TextBox x:Name="KbBox"/>
           <TextBlock Style="{StaticResource Hint}" Text="Empty: same as Windows. Only matters on the VM's screen, not in the terminal."/>
         </StackPanel>
@@ -3024,7 +3416,7 @@ $newXaml = @'
 $settingsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="VM settings" Width="520" SizeToContent="Height" ResizeMode="NoResize"
+        Title="VM settings" Width="560" SizeToContent="Height" ResizeMode="NoResize"
         WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="13" Background="White">
   <Window.Resources>
     <Style TargetType="TextBlock" x:Key="Label">
@@ -3083,13 +3475,40 @@ $settingsXaml = @'
         <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
         <TextBlock x:Name="FolderHint" Style="{StaticResource Hint}" Text="The files stay where they are; the VM just sees the new folder as ~/shared."/>
       </StackPanel>
-      <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
+      <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
       <StackPanel Grid.Row="10" Grid.Column="1">
-        <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
-        <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
-        <TextBlock Style="{StaticResource Hint}" Text="Choosing the other place moves the VM's disk, checkpoints and key there. It works while the VM runs; the shared folder stays."/>
+        <TextBox x:Name="PortsBox" Padding="4,3"/>
+        <TextBlock Style="{StaticResource Hint}" Text="e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop reach them as localhost:8080; the local network does not. Empty: none."/>
       </StackPanel>
     </Grid>
+    <Expander Header="Advanced" Margin="0,14,0,0">
+      <Grid Margin="0,8,0,0">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="150"/>
+          <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
+        <StackPanel Grid.Row="0" Grid.Column="1">
+          <WrapPanel>
+            <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,4"/>
+            <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,4"/>
+            <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,4"/>
+            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,18,4"/>
+          </WrapPanel>
+          <TextBlock x:Name="ToolHint" Style="{StaticResource Hint}" Text="Tick what to add; it is installed when you click Apply (a few minutes)."/>
+        </StackPanel>
+        <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
+        <StackPanel Grid.Row="2" Grid.Column="1">
+          <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
+          <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
+          <TextBlock Style="{StaticResource Hint}" Text="Choosing the other place moves the VM's disk, checkpoints and key there. It works while the VM runs; the shared folder stays."/>
+        </StackPanel>
+      </Grid>
+    </Expander>
     <TextBlock x:Name="ErrorText" Foreground="#C62828" TextWrapping="Wrap" Margin="0,12,0,0" Visibility="Collapsed"/>
     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
       <Button x:Name="BtnOk" Content="Apply" IsDefault="True" Margin="0,0,8,0" Background="#1F6FEB" Foreground="White" FontWeight="SemiBold"/>
@@ -3117,7 +3536,7 @@ function New-Brush([string]$Hex) {
 $win = New-Window $mainXaml
 $ui = @{}
 foreach ($n in 'VersionText', 'Banner', 'BtnFix', 'BtnRecheck', 'BannerTitle', 'BannerDetail', 'BusyText', 'BusyBar',
-    'BtnNew', 'BtnStart', 'BtnStop', 'BtnTerminal', 'TerminalChoice', 'BtnFolder', 'BtnScreen', 'BtnTest', 'BtnSettings', 'BtnRemove',
+    'BtnNew', 'BtnStart', 'BtnStop', 'BtnTerminal', 'TerminalChoice', 'BtnDesktop', 'BtnFolder', 'BtnScreen', 'BtnTest', 'BtnDiagnose', 'BtnSettings', 'BtnRemove',
     'VmList', 'EmptyText', 'BtnCopyLog', 'BtnOpenLog', 'BtnLogFolder', 'BtnClearLog', 'LogList') {
     $ui[$n] = $win.FindName($n)
 }
@@ -3132,7 +3551,8 @@ $script:LevelBrush = @{
     Info = New-Brush '#1F2937'; Step = New-Brush '#0B5CAD'; Ok = New-Brush '#1E7B34'; Warn = New-Brush '#9A6700'
     Error = New-Brush '#C62828'; Cmd = New-Brush '#4B6478'; Guest = New-Brush '#8A8F98'; Debug = New-Brush '#8A8F98'
 }
-$script:HealthBrush = @{ ready = New-Brush '#1E7B34'; quarantined = New-Brush '#C62828'; failed = New-Brush '#C62828'; creating = New-Brush '#9A6700' }
+$script:HealthBrush = @{ ready = New-Brush '#1E7B34'; quarantined = New-Brush '#C62828'; failed = New-Brush '#C62828'; creating = New-Brush '#9A6700'
+    'not responding' = New-Brush '#C62828'; 'memory full' = New-Brush '#9A6700' }
 $script:LogItems = New-Object System.Collections.ObjectModel.ObservableCollection[object]
 $ui.LogList.ItemsSource = $script:LogItems
 $script:VmItems = New-Object System.Collections.ObjectModel.ObservableCollection[object]
@@ -3210,7 +3630,7 @@ function Complete-Op {
         try { & $op.OnDone $ok $out $err } catch { Add-LogLine 'Error' "GUI: $($_.Exception.Message)" }
     } elseif (-not $ok) {
         Add-LogLine 'Error' "$($op.Title) failed: $err"
-        [System.Windows.MessageBox]::Show("$($op.Title) failed:`n`n$err`n`nThe log below shows the details.", 'AI Cage', 'OK', 'Error') | Out-Null
+        [System.Windows.MessageBox]::Show("$($op.Title) failed:`n`n$err`n`nThe log below shows the details.", 'Terrarium', 'OK', 'Error') | Out-Null
     }
     Update-VmList
 }
@@ -3236,20 +3656,31 @@ $timer.Add_Tick({
 
 function Get-SelectedVm { return $ui.VmList.SelectedItem }
 
+function Get-VmHealth($Vm) {
+    # Status from Terrarium, sharpened by what Hyper-V sees right now. No heartbeat long after
+    # the start: the VM is stuck (SSH and its screen do not react) - Diagnose tells more.
+    $h = "$($Vm.Status)"
+    if ($h -ne 'ready' -or $Vm.State -ne 'Running') { return $h }
+    if ($Vm.Heartbeat -in 'LostCommunication', 'NoContact', 'Error' -and $Vm.Uptime -and $Vm.Uptime.TotalMinutes -gt 3) { return 'not responding' }
+    if ($Vm.MemoryMaxMB -and $Vm.MemoryDemandMB -ge 0.95 * $Vm.MemoryMaxMB) { return 'memory full' }
+    return $h
+}
+
 function Update-VmList {
     $script:LastRefresh = Get-Date
     $vms = @()
     if ($script:HostOk) {
         try { $vms = @(Get-AicVm) } catch { }
     }
-    $sig = ($vms | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}' -f $_.Name, $_.State, $_.Status, $_.MemoryMB, $_.MemoryMinMB, $_.MemoryMaxMB, $_.Cpu, $_.AutoStart, $_.Isolation, $_.SharedFolder, $_.SharedReadOnly, '' }) -join ';'
+    $sig = ($vms | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}|{12}|{13}' -f $_.Name, $_.State, $_.Status, $_.MemoryMB, $_.MemoryMinMB, $_.MemoryMaxMB, $_.Cpu, $_.AutoStart, $_.Isolation, $_.SharedFolder, $_.SharedReadOnly,
+        (Get-VmHealth $_), ($_.Ports -join ','), ($_.Tools -join ',') }) -join ';'
     if ($sig -eq $script:VmSignature) { Update-Buttons; return }
     $script:VmSignature = $sig
     $selected = Get-SelectedVm
     $selName = if ($selected) { $selected.Name } else { $null }
     $script:VmItems.Clear()
     foreach ($v in $vms) {
-        $health = "$($v.Status)"
+        $health = Get-VmHealth $v
         $brush = $script:HealthBrush[$health]
         if (-not $brush) { $brush = $script:LevelBrush.Info }
         $mem = if ($v.State -eq 'Running') { "$($v.MemoryMB) MB" } else { '-' }
@@ -3257,6 +3688,7 @@ function Update-VmList {
             Name = $v.Name; State = $v.State; Health = $health; HealthBrush = $brush; Ip = $v.Ip
             Memory = "$mem  ($($v.MemoryMinMB)-$($v.MemoryMaxMB))"; Cpu = $v.Cpu
             AutoStart = $(if ($v.AutoStart) { 'yes' } else { 'no' }); Isolation = $v.Isolation; SharedFolder = $v.SharedFolder
+            Ports = (@($v.Ports | ForEach-Object { $h, $g = $_.Split(':'); if ($h -eq $g) { $h } else { "$h>$g" } }) -join ', ')
             StoredIn = $(if ($v.Location -eq 'Program') { "program folder" } else { "user folder" }); Raw = $v
         }
         $script:VmItems.Add($item)
@@ -3276,9 +3708,11 @@ function Update-Buttons {
     $ui.BtnStart.IsEnabled = -not $busy -and $v -and -not $running
     $ui.BtnStop.IsEnabled = -not $busy -and $running
     $ui.BtnTerminal.IsEnabled = $running
+    $ui.BtnDesktop.IsEnabled = $running -and @($v.Raw.Tools) -contains 'Desktop'
     $ui.BtnFolder.IsEnabled = [bool]$v
     $ui.BtnScreen.IsEnabled = $v -and -not $off
     $ui.BtnTest.IsEnabled = -not $busy -and $running
+    $ui.BtnDiagnose.IsEnabled = -not $busy -and $v -and -not $off
     $ui.BtnSettings.IsEnabled = -not $busy -and $v
     $ui.BtnRemove.IsEnabled = -not $busy -and $v
     $ui.BtnFix.IsEnabled = -not $busy
@@ -3314,7 +3748,7 @@ function Start-HostCheck {
         $lines = @($fails + $warns | ForEach-Object { "- $($_.Check): $($_.Detail)" }) -join "`n"
         if ($fails.Count) { Set-Banner fail "This laptop is not ready: $($fails.Count) problem(s)" $lines }
         elseif ($warns.Count) { Set-Banner warn 'This laptop is ready, with notes' $lines }
-        else { Set-Banner ok 'This laptop is ready for AI Cage' '' }
+        else { Set-Banner ok 'This laptop is ready for Terrarium' '' }
         $ui.BtnFix.Visibility = if ($script:HostFixes.Count) { 'Visible' } else { 'Collapsed' }
         Update-VmList
     }
@@ -3325,7 +3759,7 @@ $ui.BtnRecheck.Add_Click({ Start-HostCheck })
 $ui.BtnFix.Add_Click({
     if (-not $script:HostFixes.Count) { return }
     $list = ($script:HostFixes | ForEach-Object { "- $($_.Check): $($_.Detail)" }) -join "`n"
-    $answer = [System.Windows.MessageBox]::Show("AI Cage will fix:`n`n$list`n`nContinue?", 'Fix problems', 'YesNo', 'Question')
+    $answer = [System.Windows.MessageBox]::Show("Terrarium will fix:`n`n$list`n`nContinue?", 'Fix problems', 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
     $cmds = @($script:HostFixes | ForEach-Object { $_.Fix })
     Start-Op -Title 'Fixing' -Arg $cmds -Script @'
@@ -3333,9 +3767,9 @@ param($cmds)
 foreach ($c in $cmds) { $AicGuiQueue.Enqueue(@('Step', "Running: $c")); Invoke-Expression $c }
 '@ -OnDone {
         param($ok, $out, $err)
-        if (-not $ok) { [System.Windows.MessageBox]::Show("Fixing failed:`n`n$err", 'AI Cage', 'OK', 'Error') | Out-Null }
+        if (-not $ok) { [System.Windows.MessageBox]::Show("Fixing failed:`n`n$err", 'Terrarium', 'OK', 'Error') | Out-Null }
         if ($script:HostFixes | Where-Object { $_.Fix -like 'Enable-AicHyperV*' }) {
-            [System.Windows.MessageBox]::Show('Hyper-V was turned on. Restart Windows, then start AI Cage again.', 'AI Cage', 'OK', 'Information') | Out-Null
+            [System.Windows.MessageBox]::Show('Hyper-V was turned on. Restart Windows, then start Terrarium again.', 'Terrarium', 'OK', 'Information') | Out-Null
         }
         Start-HostCheck
     }
@@ -3358,6 +3792,7 @@ function Get-IntOrNull([string]$Text) {
 }
 
 $script:HostCpus = 4
+$script:ToolNames = @('Docker', 'ClaudeCode', 'Codex', 'Desktop')
 try { $script:HostCpus = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors } catch { }
 
 function Show-NewVmDialog {
@@ -3367,7 +3802,7 @@ function Show-NewVmDialog {
     $d.Owner = $win
     $c = @{ Window = $d; Result = $null; FolderTouched = $false }
     foreach ($n in 'NameBox', 'BtnBrowse', 'FolderBox', 'ReadOnlyBox', 'UserBox', 'PassBox', 'MinMemBox', 'MaxMemBox', 'CpuBox',
-        'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel') {
+        'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'PortsBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel') {
         $c[$n] = $d.FindName($n)
     }
     $c.Existing = @($script:VmItems | ForEach-Object { $_.Name })
@@ -3390,7 +3825,7 @@ function Show-NewVmDialog {
     $c.LocProgramBox.Add_Checked($onLoc)
     $c.UserBox.Text = 'ai'
     $c.PassBox.Text = 'ai'
-    Set-Combo $c.MinMemBox @(256, 512, 1024, 2048) 512
+    Set-Combo $c.MinMemBox @(512, 1024, 2048, 4096) 1024
     Set-Combo $c.MaxMemBox @(1024, 2048, 3072, 4096, 6144, 8192) 2048
     Set-Combo $c.CpuBox @(1..[math]::Max(1, [math]::Min(16, $script:HostCpus))) ([math]::Min(2, $script:HostCpus))
     Set-Combo $c.DiskBox @(20, 30, 50, 100) 30
@@ -3433,6 +3868,8 @@ function Show-NewVmDialog {
         if (-not $folder) { $errs += 'Choose a shared folder.' }
         $scriptPath = $k.ScriptBox.Text.Trim()
         if ($scriptPath -and -not (Test-Path -LiteralPath $scriptPath)) { $errs += 'Setup script: file not found.' }
+        $ports = @()
+        try { $ports = @(ConvertTo-AicPortList $k.PortsBox.Text) } catch { $errs += $_.Exception.Message }
         if ($errs.Count) {
             $k.ErrorText.Text = $errs -join "`n"
             $k.ErrorText.Visibility = 'Visible'
@@ -3447,8 +3884,9 @@ function Show-NewVmDialog {
         }
         $pk = @($k.PkgBox.Text -split '[\s,]+' | Where-Object { $_ })
         if ($pk.Count) { $p.Packages = $pk }
-        $tl = @('Docker', 'ClaudeCode', 'Codex' | Where-Object { $k["Tool$_"].IsChecked })
+        $tl = @($script:ToolNames | Where-Object { $k["Tool$_"].IsChecked })
         if ($tl.Count) { $p.Tools = $tl }
+        if ($ports.Count) { $p.Ports = $ports }
         if ($scriptPath) { $p.SetupScriptPath = $scriptPath }
         if ($k.TzBox.Text.Trim()) { $p.TimeZone = $k.TzBox.Text.Trim() }
         if ($k.KbBox.Text.Trim()) { $p.Keyboard = $k.KbBox.Text.Trim() }
@@ -3464,7 +3902,7 @@ function Show-QuarantineNotice([string]$Name) {
     $vm = $null
     try { $vm = Get-AicVm -Name $Name } catch { }
     if ($vm -and $vm.Status -eq 'quarantined') {
-        [System.Windows.MessageBox]::Show("$Name can reach something it must not, and repairing did not help.`n`nAI Cage disconnected its network to keep your laptop safe. The VM keeps running. The log shows what is open. After fixing that, click 'Test and secure' again - the network comes back when all tests pass.", 'AI Cage - VM quarantined', 'OK', 'Warning') | Out-Null
+        [System.Windows.MessageBox]::Show("$Name can reach something it must not, and repairing did not help.`n`nTerrarium disconnected its network to keep your laptop safe. The VM keeps running. The log shows what is open. After fixing that, click 'Test and secure' again - the network comes back when all tests pass.", 'Terrarium - VM quarantined', 'OK', 'Warning') | Out-Null
     }
 }
 
@@ -3480,7 +3918,7 @@ New-AicVm @p | Out-Null
 '@ -OnDone {
         param($ok, $out, $err)
         if ($ok) { Show-QuarantineNotice $script:LastTarget; return }
-        [System.Windows.MessageBox]::Show("Creating the VM failed:`n`n$err`n`nThe log shows the details. Remove the half-made VM with the Remove button, then try again.", 'AI Cage', 'OK', 'Error') | Out-Null
+        [System.Windows.MessageBox]::Show("Creating the VM failed:`n`n$err`n`nThe log shows the details. Remove the half-made VM with the Remove button, then try again.", 'Terrarium', 'OK', 'Error') | Out-Null
     }
 })
 
@@ -3493,10 +3931,10 @@ function Show-SettingsDialog($Raw) {
     $d.Owner = $win
     $c = @{ Window = $d; Result = $null; Raw = $Raw }
     foreach ($n in 'TitleText', 'MinMemBox', 'MaxMemBox', 'CpuBox', 'CpuHint', 'AutoBox', 'StrictBox', 'OpenBox', 'FolderBox', 'BtnBrowse', 'ReadOnlyBox',
-        'FolderHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel') { $c[$n] = $d.FindName($n) }
+        'FolderHint', 'PortsBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'ToolHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel') { $c[$n] = $d.FindName($n) }
     $script:Dlg = $c
     $c.TitleText.Text = "Settings of $($Raw.Name)"
-    Set-Combo $c.MinMemBox @(256, 512, 1024, 2048) $Raw.MemoryMinMB
+    Set-Combo $c.MinMemBox @(512, 1024, 2048, 4096) $Raw.MemoryMinMB
     Set-Combo $c.MaxMemBox @(1024, 2048, 3072, 4096, 6144, 8192) $Raw.MemoryMaxMB
     Set-Combo $c.CpuBox @(1..[math]::Max(1, [math]::Min(16, $script:HostCpus))) $Raw.Cpu
     if ($Raw.State -ne 'Off') { $c.CpuBox.IsEnabled = $false; $c.CpuHint.Visibility = 'Visible' }
@@ -3517,9 +3955,19 @@ function Show-SettingsDialog($Raw) {
     $c.LocProgramBox.Content = "Program folder:  $script:ProgramRoot"
     if ($Raw.Location -eq 'Program') { $c.LocProgramBox.IsChecked = $true } else { $c.LocHomeBox.IsChecked = $true }
     if ($script:ProgramRoot -ieq $script:HomeRoot) { $c.LocProgramBox.Visibility = 'Collapsed' }
+    $c.PortsBox.Text = @($Raw.Ports) -join ', '
+    # Installed programs stay ticked and greyed; the rest can be added (over SSH, so running only).
+    foreach ($t in $script:ToolNames) {
+        $box = $c["Tool$t"]
+        if (@($Raw.Tools) -contains $t) { $box.IsChecked = $true; $box.IsEnabled = $false; $box.Content = "$($box.Content) (installed)" }
+        elseif ($Raw.State -ne 'Running') { $box.IsEnabled = $false }
+    }
+    if ($Raw.State -ne 'Running') { $c.ToolHint.Text = 'Start the VM to install programs.' }
 
     $c.BtnOk.Add_Click({
         $k = $script:Dlg; $r = $k.Raw
+        $ports = $null
+        try { $ports = @(ConvertTo-AicPortList $k.PortsBox.Text) } catch { $k.ErrorText.Text = $_.Exception.Message; $k.ErrorText.Visibility = 'Visible'; return }
         $min = Get-IntOrNull $k.MinMemBox.Text; $max = Get-IntOrNull $k.MaxMemBox.Text
         if (-not $min -or -not $max -or $min -gt $max -or $min -lt 128) {
             $k.ErrorText.Text = 'Memory: numbers in MB, "at least" not more than "at most".'; $k.ErrorText.Visibility = 'Visible'; return
@@ -3535,6 +3983,9 @@ function Show-SettingsDialog($Raw) {
         if (-not $folder) { $k.ErrorText.Text = 'Choose a shared folder.'; $k.ErrorText.Visibility = 'Visible'; return }
         if ($folder -ne $r.SharedFolder) { $p.SharedFolder = $folder }
         if ([bool]$k.ReadOnlyBox.IsChecked -ne [bool]$r.SharedReadOnly) { $p.SharedReadOnly = [bool]$k.ReadOnlyBox.IsChecked }
+        if (($ports -join ',') -ne (@($r.Ports) -join ',')) { $p.Ports = $ports }
+        $install = @($script:ToolNames | Where-Object { $k["Tool$_"].IsEnabled -and $k["Tool$_"].IsChecked })
+        if ($install.Count) { $p.Install = $install }
         $loc = if ($k.LocProgramBox.IsChecked) { 'Program' } else { 'Home' }
         if ($loc -ne $r.Location) { $p.Location = $loc }
         $k.Result = $p
@@ -3549,12 +4000,14 @@ $ui.BtnSettings.Add_Click({
     if (-not $v) { return }
     $p = Show-SettingsDialog $v.Raw
     if (-not $p -or $p.Count -le 1) { return }
-    $title = if ($p.Location -and $p.Count -eq 2) { "Moving $($p.Name)" } else { "Changing $($p.Name)" }
+    $title = if ($p.Location -and $p.Count -eq 2) { "Moving $($p.Name)" } elseif ($p.Install) { "Installing in $($p.Name)" } else { "Changing $($p.Name)" }
     Start-Op -Title $title -Arg $p -Script @'
 param($p)
 $to = $p.Location
-$p.Remove('Location')
+$install = $p.Install
+$p.Remove('Location'); $p.Remove('Install')
 if ($p.Count -gt 1) { Set-AicVm @p -Confirm:$false | Out-Null }
+if ($install) { Install-AicTool -Name $p.Name -Tool $install }
 if ($to) { Move-AicVm -Name $p.Name -To $to }
 '@
 })
@@ -3578,11 +4031,50 @@ $ui.BtnTest.Add_Click({
     $script:LastTarget = $v.Name
     Start-Op -Title "Testing $($v.Name)" -Arg $v.Name -Script 'param($n) Test-AicVm -Name $n | Out-Null' -OnDone {
         param($ok, $out, $err)
-        if (-not $ok) { [System.Windows.MessageBox]::Show("The test could not run:`n`n$err", 'AI Cage', 'OK', 'Error') | Out-Null; return }
+        if (-not $ok) { [System.Windows.MessageBox]::Show("The test could not run:`n`n$err", 'Terrarium', 'OK', 'Error') | Out-Null; return }
         $script:VmSignature = $null
         Update-VmList
         Show-QuarantineNotice $script:LastTarget
     }
+})
+
+# Diagnose: why the VM does not answer. A stuck VM can only be reset; after that, Diagnose
+# reads the VM's log of the stuck boot.
+function Start-Diagnose([string]$Name) {
+    Start-Op -Title "Diagnosing $Name" -Arg $Name -Script 'param($n) Debug-AicVm -Name $n' -OnDone {
+        param($ok, $out, $err)
+        if (-not $ok) { [System.Windows.MessageBox]::Show("Diagnose could not run:`n`n$err", 'Terrarium', 'OK', 'Error') | Out-Null; return }
+        $r = @($out)[-1]
+        $found = if ($r.Problems.Count) { ($r.Problems | ForEach-Object { "- $_" }) -join "`n" } else { 'Nothing found - the log below shows what was checked.' }
+        if ($r.Running -and -not $r.Responding) {
+            $a = [System.Windows.MessageBox]::Show("$($r.Name) does not answer.`n`n$found`n`nRestart it now? This is like pressing its power button: whatever runs in the VM is stopped without saving. Afterwards, Diagnose again reads the VM's log of the stuck boot.", 'Terrarium - Diagnose', 'YesNo', 'Warning')
+            if ($a -eq 'Yes') { Start-Op -Title "Restarting $($r.Name)" -Arg $r.Name -Script 'param($n) Restart-AicVm -Name $n -Force' }
+        } else {
+            $icon = if ($r.Problems.Count) { 'Warning' } else { 'Information' }
+            [System.Windows.MessageBox]::Show("$($r.Name):`n`n$found", 'Terrarium - Diagnose', 'OK', $icon) | Out-Null
+        }
+    }
+}
+
+$ui.BtnDiagnose.Add_Click({
+    $v = Get-SelectedVm; if (-not $v) { return }
+    Start-Diagnose $v.Name
+})
+
+function Open-Vm($Vm, [string]$With) {
+    try { Connect-AicVm -Name $Vm.Name -With $With }
+    catch {
+        Add-LogLine 'Error' "$($With): $($_.Exception.Message)"
+        if ($_.Exception.Message -like '*does not answer*' -and -not $script:Op) {
+            $a = [System.Windows.MessageBox]::Show("$($_.Exception.Message)`n`nFind out why now (Diagnose)?", 'Terrarium', 'YesNo', 'Warning')
+            if ($a -eq 'Yes') { Start-Diagnose $Vm.Name }
+        }
+    }
+}
+
+$ui.BtnDesktop.Add_Click({
+    $v = Get-SelectedVm; if (-not $v) { return }
+    Open-Vm $v 'Desktop'
 })
 
 $ui.BtnRemove.Add_Click({
@@ -3617,7 +4109,7 @@ foreach ($it in $ui.TerminalChoice.ContextMenu.Items) {
 
 $ui.BtnTerminal.Add_Click({
     $v = Get-SelectedVm; if (-not $v) { return }
-    try { Connect-AicVm -Name $v.Name -With $script:TerminalProgram } catch { Add-LogLine 'Error' "Terminal: $($_.Exception.Message)" }
+    Open-Vm $v $script:TerminalProgram
 })
 
 $ui.BtnFolder.Add_Click({
@@ -3634,7 +4126,7 @@ $ui.BtnScreen.Add_Click({
 $ui.VmList.Add_SelectionChanged({ Update-Buttons })
 $ui.VmList.Add_MouseDoubleClick({
     $v = Get-SelectedVm
-    if ($v -and $v.State -eq 'Running') { try { Connect-AicVm -Name $v.Name -With $script:TerminalProgram } catch { Add-LogLine 'Error' "Terminal: $($_.Exception.Message)" } }
+    if ($v -and $v.State -eq 'Running') { Open-Vm $v $script:TerminalProgram }
 })
 
 $ui.BtnCopyLog.Add_Click({ [System.Windows.Clipboard]::SetText((($script:LogItems | ForEach-Object { $_.Text }) -join "`r`n")) })
@@ -3649,7 +4141,7 @@ $ui.BtnOpenLog.Add_Click({
 $win.Add_Closing({
     param($src, $e)
     if ($script:Op) {
-        $a = [System.Windows.MessageBox]::Show("'$($script:Op.Title)' is still running. Closing now may leave it half done.`n`nClose anyway?", 'AI Cage', 'YesNo', 'Warning')
+        $a = [System.Windows.MessageBox]::Show("'$($script:Op.Title)' is still running. Closing now may leave it half done.`n`nClose anyway?", 'Terrarium', 'YesNo', 'Warning')
         if ($a -ne 'Yes') { $e.Cancel = $true }
     }
 })
@@ -3659,13 +4151,13 @@ $win.Add_Closing({
 # ---------------------------------------------------------------------------------------------
 
 try {
-    Add-LogLine 'Info' "AI Cage $script:Version - tool folder $script:Root"
+    Add-LogLine 'Info' "Terrarium $script:Version - tool folder $script:Root"
     Update-VmList
     $win.Add_ContentRendered({ Start-HostCheck })
     $timer.Start()
     [void]$win.ShowDialog()
 } catch {
-    Show-Fatal "AI Cage stopped: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+    Show-Fatal "Terrarium stopped: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
 } finally {
     $timer.Stop()
     try { $script:Worker.Close() } catch { }

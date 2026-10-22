@@ -1852,20 +1852,30 @@ function Start-AicPutty {
 # ---- Remote Desktop -------------------------------------------------------------------------
 # The VM's desktop (xrdp) in Windows' Remote Desktop, with a .rdp file that shares nothing of
 # this laptop: no drives, printers, devices - and no clipboard, which often holds passwords.
-# (Set redirectclipboard:i:1 in the file if you want copy and paste.)
+# (Set redirectclipboard:i:1 in the file if you want copy and paste.) Sound plays on the laptop
+# only when the VM's Sound setting is on; the microphone is never shared.
+
+function Test-AicSound($State) {
+    return [bool]($State.PSObject.Properties['Sound'] -and $State.Sound)
+}
 
 function Start-AicDesktop {
     param([Parameter(Mandatory)]$State)
     $rdp = Join-Path (Split-Path (Get-AicStatePath -Name $State.Name -Location (Get-AicStateLocation $State))) "$($State.Name).rdp"
     if (-not (Test-Path -LiteralPath $rdp)) {
         $lines = @(
-            "full address:s:$($State.Ip)", "username:s:$($State.User)", 'screen mode id:i:1', 'smart sizing:i:1', 'dynamic resolution:i:1'
+            "full address:s:$($State.Ip)", "username:s:$($State.User)", 'screen mode id:i:1', 'dynamic resolution:i:1'   # no smart sizing: it scales the picture instead of resizing the desktop
             'authentication level:i:0', 'enablecredsspsupport:i:0', 'prompt for credentials:i:0'
             'redirectclipboard:i:0', 'redirectprinters:i:0', 'redirectdrives:i:0', 'drivestoredirect:s:', 'redirectcomports:i:0'
-            'redirectsmartcards:i:0', 'devicestoredirect:s:', 'camerastoredirect:s:', 'audiomode:i:0', 'audiocapturemode:i:0'
+            'redirectsmartcards:i:0', 'devicestoredirect:s:', 'camerastoredirect:s:', 'audiomode:i:2', 'audiocapturemode:i:0'
         )
         Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
     }
+    # audiomode 0 plays the VM's sound here, 2 drops it. Only this line follows the setting, so
+    # other edits to the file stay.
+    $audio = if (Test-AicSound $State) { 'audiomode:i:0' } else { 'audiomode:i:2' }
+    $lines = @(Get-Content -LiteralPath $rdp -Encoding Unicode | Where-Object { $_ -notmatch '^audiomode:' }) + $audio
+    Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
     Write-AicLog "mstsc.exe $rdp  (log in as $($State.User) with your Linux password)" -Level Debug
     Start-Process -FilePath 'mstsc.exe' -ArgumentList "`"$rdp`""
 }
@@ -2226,12 +2236,14 @@ codex --version
 '@ }
     # XFCE: a full desktop at a fraction of GNOME's or KDE's size (about 1 GB on disk, 400 MB
     # of memory). It is opened with Remote Desktop (xrdp in the VM), which unlike the Hyper-V
-    # screen resizes with the window. The VM's screen keeps its text login.
+    # screen resizes with the window. The VM's screen keeps its text login. Sound (PipeWire's xrdp
+    # module) reaches the laptop only with the VM's Sound setting on - see Start-AicDesktop.
     Desktop    = @{ Title = 'Desktop (XFCE)'; Script = @'
 set -e
 sudo apt-get -o DPkg::Lock::Timeout=300 update -q
 sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends \
-  xfce4 xfce4-terminal xfce4-notifyd mousepad dbus-x11 at-spi2-core xrdp xorgxrdp firefox-esr
+  xfce4 xfce4-terminal xfce4-notifyd mousepad dbus-x11 at-spi2-core xrdp xorgxrdp firefox-esr \
+  pipewire pipewire-pulse wireplumber pipewire-module-xrdp
 sudo adduser xrdp ssl-cert >/dev/null 2>&1 || true   # xrdp reads the TLS key
 echo xfce4-session > "$HOME/.xsession"
 sudo systemctl enable xrdp
@@ -2317,6 +2329,7 @@ function New-AicVm {
         [string[]]$Packages = @(),
         [ValidateSet('Docker', 'ClaudeCode', 'Codex', 'Desktop')][string[]]$Tools = @(),
         [string[]]$Ports = @(),
+        [bool]$Sound = $false,
         [ValidateSet('Home', 'Program')][string]$Location = 'Home',
         [string]$SetupScriptPath,
         [bool]$PasswordlessSudo = $true,
@@ -2457,6 +2470,11 @@ function New-AicVm {
             Get-VMDvdDrive -VMName $Name | Set-VMDvdDrive -Path $null
             try { Get-VMDvdDrive -VMName $Name | Remove-VMDvdDrive } catch { Write-AicLog 'Empty DVD drive stays attached (Hyper-V cannot remove it while the VM runs) - harmless' -Level Debug }
             Remove-Item -LiteralPath $iso -Force
+        }
+
+        if ($Sound) {
+            $state | Add-Member -NotePropertyName Sound -NotePropertyValue $true -Force
+            Save-AicState $state
         }
 
         if ($Tools.Count) {
@@ -2617,6 +2635,7 @@ function Get-AicVm {
                 MemoryDemandMB = if ($vm) { [int]($vm.MemoryDemand / 1MB) } else { 0 }
                 Tools        = @(Get-AicInstalledTool $s)
                 Ports        = @(Get-AicPortForward $s)
+                Sound        = Test-AicSound $s
             }
         }
     }
@@ -2625,11 +2644,13 @@ function Get-AicVm {
 function Set-AicVm {
     <#
     .SYNOPSIS
-    Changes memory, processors, autostart, isolation, the shared folder or the port forwards of a
-    Terrarium VM.
+    Changes memory, processors, autostart, isolation, the shared folder, the port forwards or the
+    desktop's sound of a Terrarium VM.
     .PARAMETER Ports
     Laptop ports forwarded to the VM, e.g. 8080, '3000:80' (laptop:VM). Apps on this laptop then
     reach them as localhost:8080; the local network does not. @() removes all forwards.
+    .PARAMETER Sound
+    Plays the desktop's sound on this laptop (from the next Remote Desktop connection on).
     .NOTES
     Processor count and startup memory need the VM off; the rest works while it runs.
     #>
@@ -2644,7 +2665,8 @@ function Set-AicVm {
         [ValidateSet('Strict', 'Open')][string]$Isolation,
         [string]$SharedFolder,
         [bool]$SharedReadOnly,
-        [AllowEmptyCollection()][string[]]$Ports
+        [AllowEmptyCollection()][string[]]$Ports,
+        [bool]$Sound
     )
     process {
         Assert-AicReady
@@ -2692,6 +2714,11 @@ function Set-AicVm {
             $s | Add-Member -NotePropertyName Ports -NotePropertyValue $list -Force
             Invoke-AicStep "Port forwards: $(if ($list.Count) { $list -join ', ' } else { 'none' })" { Set-AicPortForward -State $s }
             Save-AicState $s
+        }
+        if ($PSBoundParameters.ContainsKey('Sound')) {
+            $s | Add-Member -NotePropertyName Sound -NotePropertyValue $Sound -Force
+            Save-AicState $s
+            Write-AicLog "Desktop sound: $(if ($Sound) { 'on' } else { 'off' }) (from the next Remote Desktop connection)" -Level Ok
         }
         Get-AicVm -Name $Name
     }
@@ -3368,9 +3395,10 @@ $newXaml = @'
             <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,0"/>
             <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,0"/>
             <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,0"/>
-            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,18,0"/>
+            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,0"/>
+            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,18,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
           </WrapPanel>
-          <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more). Desktop: a light graphical desktop with Firefox, opened with the Desktop button (Remote Desktop); about 1 GB."/>
+          <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more). Desktop: a light graphical desktop with Firefox, opened with the Desktop button (Remote Desktop); about 1 GB. With sound, the VM's sound plays on this laptop (the microphone is never shared)."/>
         </StackPanel>
         <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
         <StackPanel Grid.Row="2" Grid.Column="1">
@@ -3497,7 +3525,8 @@ $settingsXaml = @'
             <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,4"/>
             <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,4"/>
             <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,4"/>
-            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,18,4"/>
+            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,4"/>
+            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,18,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
           </WrapPanel>
           <TextBlock x:Name="ToolHint" Style="{StaticResource Hint}" Text="Tick what to add; it is installed when you click Apply (a few minutes)."/>
         </StackPanel>
@@ -3802,7 +3831,7 @@ function Show-NewVmDialog {
     $d.Owner = $win
     $c = @{ Window = $d; Result = $null; FolderTouched = $false }
     foreach ($n in 'NameBox', 'BtnBrowse', 'FolderBox', 'ReadOnlyBox', 'UserBox', 'PassBox', 'MinMemBox', 'MaxMemBox', 'CpuBox',
-        'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'PortsBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel') {
+        'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'PortsBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel') {
         $c[$n] = $d.FindName($n)
     }
     $c.Existing = @($script:VmItems | ForEach-Object { $_.Name })
@@ -3887,6 +3916,7 @@ function Show-NewVmDialog {
         $tl = @($script:ToolNames | Where-Object { $k["Tool$_"].IsChecked })
         if ($tl.Count) { $p.Tools = $tl }
         if ($ports.Count) { $p.Ports = $ports }
+        if ($k.ToolDesktop.IsChecked -and $k.SoundBox.IsChecked) { $p.Sound = $true }
         if ($scriptPath) { $p.SetupScriptPath = $scriptPath }
         if ($k.TzBox.Text.Trim()) { $p.TimeZone = $k.TzBox.Text.Trim() }
         if ($k.KbBox.Text.Trim()) { $p.Keyboard = $k.KbBox.Text.Trim() }
@@ -3931,7 +3961,7 @@ function Show-SettingsDialog($Raw) {
     $d.Owner = $win
     $c = @{ Window = $d; Result = $null; Raw = $Raw }
     foreach ($n in 'TitleText', 'MinMemBox', 'MaxMemBox', 'CpuBox', 'CpuHint', 'AutoBox', 'StrictBox', 'OpenBox', 'FolderBox', 'BtnBrowse', 'ReadOnlyBox',
-        'FolderHint', 'PortsBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'ToolHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel') { $c[$n] = $d.FindName($n) }
+        'FolderHint', 'PortsBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'ToolHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel') { $c[$n] = $d.FindName($n) }
     $script:Dlg = $c
     $c.TitleText.Text = "Settings of $($Raw.Name)"
     Set-Combo $c.MinMemBox @(512, 1024, 2048, 4096) $Raw.MemoryMinMB
@@ -3956,6 +3986,7 @@ function Show-SettingsDialog($Raw) {
     if ($Raw.Location -eq 'Program') { $c.LocProgramBox.IsChecked = $true } else { $c.LocHomeBox.IsChecked = $true }
     if ($script:ProgramRoot -ieq $script:HomeRoot) { $c.LocProgramBox.Visibility = 'Collapsed' }
     $c.PortsBox.Text = @($Raw.Ports) -join ', '
+    $c.SoundBox.IsChecked = [bool]$Raw.Sound
     # Installed programs stay ticked and greyed; the rest can be added (over SSH, so running only).
     foreach ($t in $script:ToolNames) {
         $box = $c["Tool$t"]
@@ -3984,6 +4015,8 @@ function Show-SettingsDialog($Raw) {
         if ($folder -ne $r.SharedFolder) { $p.SharedFolder = $folder }
         if ([bool]$k.ReadOnlyBox.IsChecked -ne [bool]$r.SharedReadOnly) { $p.SharedReadOnly = [bool]$k.ReadOnlyBox.IsChecked }
         if (($ports -join ',') -ne (@($r.Ports) -join ',')) { $p.Ports = $ports }
+        $sound = [bool]($k.ToolDesktop.IsChecked -and $k.SoundBox.IsChecked)
+        if ($sound -ne [bool]$r.Sound) { $p.Sound = $sound }
         $install = @($script:ToolNames | Where-Object { $k["Tool$_"].IsEnabled -and $k["Tool$_"].IsChecked })
         if ($install.Count) { $p.Install = $install }
         $loc = if ($k.LocProgramBox.IsChecked) { 'Program' } else { 'Home' }

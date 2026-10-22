@@ -32,9 +32,14 @@ the protection; if that does not help, it disconnects the VM's network and tells
 ## Desktop
 
 *Desktop (XFCE)* installs a light graphical desktop with Firefox (about 1 GB). The **Desktop**
-button opens it in Windows' Remote Desktop; log in with the Linux user and password. Remote
-Desktop shares nothing of your laptop with the VM - not even the clipboard, which often holds
-passwords. To allow copy and paste, set `redirectclipboard:i:1` in the VM's `.rdp` file (next to
+button opens it in Windows' Remote Desktop; log in with the Linux user and password. The desktop
+resizes with the window. Remote Desktop shares nothing of your laptop with the VM - not even the
+clipboard, which often holds passwords.
+
+*with sound* (next to Desktop, also in **Settings**) plays the VM's sound on the laptop, e.g. for
+videos. It is off by default: it only goes from the VM to the laptop - the microphone is never
+shared - but it gives a VM one more way to talk to Windows' Remote Desktop program. A change
+applies from the next Remote Desktop connection. To allow copy and paste, set `redirectclipboard:i:1` in the VM's `.rdp` file (next to
 its disk).
 
 ## Ports

@@ -99,8 +99,7 @@ Layer by layer:
    smart cards, cameras, other devices and the microphone. Sound and the clipboard are off unless
    you tick them for that VM.
 8. **The VM is not told who the laptop is.** Hyper-V's *Data Exchange* service, which would
-   give the VM the laptop's name, domain and Windows build, is off; older VMs are switched over
-   (and the details they got deleted) at the next check.
+   give the VM the laptop's name, domain and Windows build, is off.
 9. **Secrets are cleaned up.** The cloud-init seed ISO (it holds the passwords) is detached and
    deleted after the first boot; cloud-init's copies of it inside the VM are deleted and
    cloud-init is switched off.
@@ -338,10 +337,8 @@ What remains:
 **Info - handled.** Hyper-V's *Data Exchange* integration service would tell every VM the
 laptop's computer name, its fully qualified name (which can include your company's domain) and
 the Windows and hypervisor build numbers (`/var/lib/hyperv/.kvp_pool_3`) - handy for picking an
-exploit. Terrarium turns it off for its VMs: new VMs never get the details; older VMs are
-switched over at the next start, *Check again* or *Test and secure*, and what they already got
-is deleted (that needs passwordless `sudo` in the VM). Side effect: Hyper-V Manager shows no
-address for these VMs; Terrarium does not need it.
+exploit. Terrarium turns it off for its VMs, before their first start. Side effect: Hyper-V
+Manager shows no address for these VMs; Terrarium does not need it.
 
 ### Hyper-V escape
 
@@ -408,9 +405,6 @@ Changes that would close or shrink some of the risks above:
    when the Desktop is not installed.
 4. Refresh the VPN routes automatically while a VM runs (today: at start, *Check again*,
    *Start*, *Test and secure*).
-
-Done in this version: warnings for risky shared folders, VMs without a shared folder, the
-clipboard switch, VPN routes and `BlockRanges` in *Strict*, the laptop's details hidden.
 
 ## Reporting a vulnerability
 

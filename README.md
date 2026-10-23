@@ -4,14 +4,24 @@ Isolated Linux (Debian 13) virtual machines for AI agents on Windows. The AI get
 rights inside its VM, the internet and - if you want - one shared folder. It can't see the rest
 of your files, your home, office or cowork network, or other VMs.
 
+<p align="center">
+  <a href="https://github.com/parvuselephantus/Terrarium/releases/latest/download/Terrarium.zip"><img src="https://img.shields.io/badge/%E2%AC%87%20Download-Terrarium%20for%20Windows-2e8f69?style=for-the-badge" alt="Download Terrarium for Windows" height="40"></a>
+</p>
+<p align="center">
+  Free and open source &middot; Windows 10/11 Pro, Enterprise or Education &middot;
+  <a href="https://github.com/parvuselephantus/Terrarium/releases">all versions</a>
+</p>
+
+**How to start:** unzip the download, read the two files inside (they are plain text), then
+double-click `Terrarium.cmd`. The [Start](#start) section below explains every step.
+
 https://github.com/user-attachments/assets/cb3d2f92-6332-47be-be5d-978e01c5d82f
 
 *The 5-minute introduction: installing, creating a VM, everyday use and what keeps it safe.
 Full quality: [terrarium-intro.mp4](https://github.com/parvuselephantus/Terrarium/releases/download/v1.0.0/terrarium-intro.mp4)
 ([1.0.0 release](https://github.com/parvuselephantus/Terrarium/releases/tag/v1.0.0)).*
 
-Version 1.0.0. Formerly called *AI Cage*: VMs made by AI Cage keep working, and its internal
-names (the `.aicage` folder, the `AICage` virtual switch, the `*-Aic*` commands) stay.
+Version 1.0.0.
 
 ## Safety at a glance
 
@@ -130,15 +140,15 @@ event log for the VM and - once SSH works - the VM's system log of this and the 
 For a stuck VM it offers a restart; Diagnose afterwards explains the stuck boot.
 
 The most common cause is memory: Hyper-V's Dynamic Memory gives an idle VM back to its minimum
-and a busy VM then freezes. Keep *at least* at 1024 MB or more (the default since 0.4.0).
+and a busy VM then freezes. Keep *at least* at 1024 MB or more (the default).
 
 ## Good to know
 
 - Put nothing in the shared folder that the AI must not see. The AI is root in its VM. Terrarium
   warns when the folder looks risky, but never refuses it.
 - The VM is not told the laptop's name, domain or Windows build (Hyper-V's *Data Exchange*
-  service is off for Terrarium VMs; older VMs are switched over at the next check). Hyper-V
-  Manager therefore shows no address for them - the Terrarium window does.
+  service is off for Terrarium VMs). Hyper-V Manager therefore shows no address for them - the
+  Terrarium window does.
 - Secrets you give the AI (API keys, tokens, the `claude` / `codex` login) can be read and sent
   anywhere by it. Use separate, limited keys for the VM.
 - Files the AI wrote are like downloads from the internet: do not double-click them, open the

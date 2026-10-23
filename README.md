@@ -4,9 +4,11 @@ Isolated Linux (Debian 13) virtual machines for AI agents on Windows. The AI get
 rights inside its VM, the internet and - if you want - one shared folder. It can't see the rest
 of your files, your home, office or cowork network, or other VMs.
 
-**[Watch the 5-minute introduction](https://github.com/parvuselephantus/Terrarium/releases/download/v1.0.0/terrarium-intro.mp4)**
-(attached to the [1.0.0 release](https://github.com/parvuselephantus/Terrarium/releases/tag/v1.0.0)) -
-installing, creating a VM, everyday use and what keeps it safe.
+https://github.com/user-attachments/assets/cb3d2f92-6332-47be-be5d-978e01c5d82f
+
+*The 5-minute introduction: installing, creating a VM, everyday use and what keeps it safe.
+Full quality: [terrarium-intro.mp4](https://github.com/parvuselephantus/Terrarium/releases/download/v1.0.0/terrarium-intro.mp4)
+([1.0.0 release](https://github.com/parvuselephantus/Terrarium/releases/tag/v1.0.0)).*
 
 Version 1.0.0. Formerly called *AI Cage*: VMs made by AI Cage keep working, and its internal
 names (the `.aicage` folder, the `AICage` virtual switch, the `*-Aic*` commands) stay.

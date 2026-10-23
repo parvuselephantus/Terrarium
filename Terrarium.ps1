@@ -1,5 +1,5 @@
 <#
-Terrarium 0.4.0 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
+Terrarium 1.0.0 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
 (Formerly "AI Cage": internal names - the .aicage folder, the AICage switch, the Aic commands -
 keep the old name so existing VMs go on working.)
 Start it with Terrarium.cmd (it asks for Administrator rights).   Terrarium.cmd console = commands only.
@@ -34,8 +34,8 @@ function Get-AicLeftovers {
         Where-Object { $_.Name -like 'AICage-*' -and $names -notcontains $_.Name.Substring(7) } |
         ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'Share'; Name = $_.Name; Detail = $_.Path; Sid = $null }) }
 
-    Get-NetFirewallRule -Name 'AICage-SMB-*' -ErrorAction SilentlyContinue |
-        Where-Object { $names -notcontains $_.Name.Substring(11) } |
+    Get-NetFirewallRule -Name 'AICage-SMB-*', 'AICage-NoSMB-*' -ErrorAction SilentlyContinue |
+        Where-Object { $names -notcontains ($_.Name -replace '^AICage-(No)?SMB-', '') } |
         ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'Firewall'; Name = $_.Name; Detail = $_.DisplayName; Sid = $null }) }
 
     $putty = 'HKCU:\Software\SimonTatham\PuTTY\Sessions'
@@ -154,6 +154,20 @@ function ConvertTo-AicB64([string]$s) { return [Convert]::ToBase64String([Text.E
 # Runs as root. Written to disk every 30 s (not 5 min), so even a hard hang leaves its traces.
 $script:AicJournalSetup = 'mkdir -p /etc/systemd/journald.conf.d /var/log/journal && printf "[Journal]\nStorage=persistent\nSyncIntervalSec=30s\n" > /etc/systemd/journald.conf.d/terrarium.conf && systemd-tmpfiles --create --prefix /var/log/journal && systemctl restart systemd-journald'
 
+# Mounts the share at /mnt/shared (= ~/shared). Needs USER_NAME, HOST_IP, SHARE, RO and log();
+# used at the first boot and when a shared folder is added later.
+$script:AicMountScript = @'
+uid=$(id -u "$USER_NAME"); gid=$(id -g "$USER_NAME")
+opts="credentials=/root/.smb-aicage,uid=$uid,gid=$gid,vers=3.1.1,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount"
+[ "$RO" = 1 ] && opts="ro,$opts"
+mkdir -p /mnt/shared
+grep -q " /mnt/shared " /etc/fstab || echo "//$HOST_IP/$SHARE /mnt/shared cifs $opts 0 0" >> /etc/fstab
+systemctl daemon-reload
+systemctl restart remote-fs.target || true
+if ls /mnt/shared >/dev/null 2>&1; then log "shared folder mounted at /mnt/shared"; else log "WARNING: shared folder did not mount"; fi
+ln -sfn /mnt/shared "/home/$USER_NAME/shared" && chown -h "$USER_NAME:$USER_NAME" "/home/$USER_NAME/shared"
+'@
+
 function New-AicFirstBootScript {
     param($State, [string]$Keyboard)
     $ro = if ($State.SharedReadOnly) { '1' } else { '0' }
@@ -172,15 +186,7 @@ function New-AicFirstBootScript {
         '# Keep the system log across restarts: after a hang, "journalctl -b -1" shows what happened.'
         $script:AicJournalSetup
         ''
-        'uid=$(id -u "$USER_NAME"); gid=$(id -g "$USER_NAME")'
-        'opts="credentials=/root/.smb-aicage,uid=$uid,gid=$gid,vers=3.1.1,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount"'
-        '[ "$RO" = 1 ] && opts="ro,$opts"'
-        'mkdir -p /mnt/shared'
-        'grep -q " /mnt/shared " /etc/fstab || echo "//$HOST_IP/$SHARE /mnt/shared cifs $opts 0 0" >> /etc/fstab'
-        'systemctl daemon-reload'
-        'systemctl restart remote-fs.target || true'
-        'if ls /mnt/shared >/dev/null 2>&1; then log "shared folder mounted at /mnt/shared"; else log "WARNING: shared folder did not mount"; fi'
-        'ln -sfn /mnt/shared "/home/$USER_NAME/shared" && chown -h "$USER_NAME:$USER_NAME" "/home/$USER_NAME/shared"'
+        $(if (Test-AicHasShare $State) { $script:AicMountScript } else { 'log "no shared folder: this VM sees no folder of the laptop"' })
         ''
         'if [ -x /usr/local/sbin/aicage-setup.sh ]; then'
         '  log "running setup script"'
@@ -199,7 +205,7 @@ function New-AicUserData {
     param(
         [Parameter(Mandatory)]$State,
         [Parameter(Mandatory)][string]$LinuxPassword,
-        [Parameter(Mandatory)][string]$SharePassword,
+        [string]$SharePassword,
         [Parameter(Mandatory)][string]$PublicKey,
         [string]$TimeZone, [string]$Keyboard,
         [string[]]$Packages, [string]$SetupScript,
@@ -239,11 +245,13 @@ function New-AicUserData {
         $y.Add("  maxsize: $bytes")
     }
     $y.Add('write_files:')
-    $y.Add('  - path: /root/.smb-aicage')
-    $y.Add("    owner: 'root:root'")
-    $y.Add("    permissions: '0600'")
-    $y.Add('    encoding: b64')
-    $y.Add("    content: $(ConvertTo-AicB64 "username=$($State.ShareAccount)`npassword=$SharePassword`n")")
+    if (Test-AicHasShare $State) {
+        $y.Add('  - path: /root/.smb-aicage')
+        $y.Add("    owner: 'root:root'")
+        $y.Add("    permissions: '0600'")
+        $y.Add('    encoding: b64')
+        $y.Add("    content: $(ConvertTo-AicB64 "username=$($State.ShareAccount)`npassword=$SharePassword`n")")
+    }
     $y.Add('  - path: /usr/local/sbin/aicage-firstboot.sh')
     $y.Add("    permissions: '0755'")
     $y.Add('    encoding: b64')
@@ -313,7 +321,7 @@ function New-AicSeedIso {
 # settings) and the program folder ("Program"). Each VM is in one of them, chosen when it is
 # made; Terrarium looks in both. Root is the Home place ("Root" in config.json overrides it).
 
-$script:AicVersion = '0.4.0'
+$script:AicVersion = '1.0.0'
 
 # Terrarium.ps1 (the single-file build) passes the tool folder as $AicToolRoot; the module form
 # (development) finds it as the parent of the module folder.
@@ -331,6 +339,11 @@ $script:AicDefaults = [ordered]@{
     Dns         = @('1.1.1.1', '9.9.9.9')
     ImageBase   = 'https://cloud.debian.org/images/cloud/trixie/latest'
     ImageName   = 'debian-13-generic-amd64'
+    # Strict isolation: extra address ranges to deny (e.g. a company network on public addresses),
+    # and whether networks the laptop has a route to (VPN, an office LAN on public addresses) are
+    # denied too.
+    BlockRanges    = @()
+    BlockVpnRoutes = $true
 }
 
 $script:AicConfigCache = $null
@@ -1140,11 +1153,69 @@ function Split-AicCidr {
     return , $out
 }
 
+function Test-AicInRange([string]$Cidr, [string[]]$Ranges) {
+    # Is the network $Cidr completely inside one of $Ranges?
+    $p = $Cidr.Split('/'); $len = if ($p.Count -gt 1) { [int]$p[1] } else { 32 }
+    $n = ConvertTo-AicUInt $p[0]
+    foreach ($r in $Ranges) {
+        $q = $r.Split('/'); $rl = [int]$q[1]
+        if ($len -ge $rl -and (($n -band (Get-AicMask $rl)) -eq ((ConvertTo-AicUInt $q[0]) -band (Get-AicMask $rl)))) { return $true }
+    }
+    return $false
+}
+
+function Get-AicRoutedRanges {
+    # Public-address networks this laptop has its own route to: what a split-tunnel VPN adds for
+    # the company's networks, or an office LAN on public addresses. The VM would reach them through
+    # the NAT although they are not "the internet", so Strict denies them too. Private ranges are
+    # denied anyway; routes shorter than /8 (e.g. a full-tunnel VPN's 0.0.0.0/1) are the internet.
+    $cfg = Get-AicConfig
+    if (-not $cfg.BlockVpnRoutes) { return @() }
+    $sw = Get-AicSwitchAdapter
+    $skip = @('0.0.0.0/8', '127.0.0.0/8', '224.0.0.0/3') + $script:AicLanRanges
+    $out = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+            (-not $sw -or $_.ifIndex -ne $sw.ifIndex) -and [int]$_.DestinationPrefix.Split('/')[1] -ge 8 -and
+            -not (Test-AicInRange $_.DestinationPrefix $skip)
+        } | ForEach-Object { $_.DestinationPrefix } | Select-Object -Unique)
+    if ($out.Count -gt 200) {
+        Write-AicLog "The laptop has $($out.Count) routes to public networks - only the first 200 are denied (BlockRanges in config.json adds more)" -Level Warn
+        $out = $out[0..199]
+    }
+    return $out
+}
+
 function Get-AicDenyRanges {
     $hostIp = Get-AicHostIp
     $list = @()
-    foreach ($r in $script:AicLanRanges) { $list += Split-AicCidr -Cidr $r -ExcludeIp $hostIp }
-    return , ($list + $script:AicLanRanges6)
+    $extra = @(@((Get-AicConfig).BlockRanges) | Where-Object { $_ }) + @(Get-AicRoutedRanges)
+    foreach ($r in @($script:AicLanRanges) + $extra) {
+        if ($r -notmatch '/') { $r = "$r/32" }
+        $list += Split-AicCidr -Cidr $r -ExcludeIp $hostIp
+    }
+    return , (@($list | ForEach-Object { $_ -replace '/32$', '' } | Select-Object -Unique) + $script:AicLanRanges6)
+}
+
+function ConvertTo-AicAclKey([string]$Ip) {
+    # Hyper-V reports single addresses with /32; compare them in one form.
+    if ($Ip -notmatch '/') { return "$Ip/32" }
+    return $Ip
+}
+
+function Sync-AicIsolation {
+    # Strict VMs: brings the network filter up to date when the laptop's routes changed (VPN
+    # connected or disconnected) or config.json's BlockRanges did. Returns $true when it changed.
+    param([Parameter(Mandatory)]$State)
+    if ($State.Isolation -ne 'Strict' -or -not (Get-VM -Name $State.Name -ErrorAction SilentlyContinue)) { return $false }
+    $want = @(Get-AicDenyRanges | ForEach-Object { ConvertTo-AicAclKey $_ } | Sort-Object -Unique)
+    $have = @(Get-VMNetworkAdapterAcl -VMName $State.Name -ErrorAction SilentlyContinue | Where-Object Action -eq 'Deny' |
+        ForEach-Object { ConvertTo-AicAclKey "$($_.RemoteIPAddress)" } | Sort-Object -Unique)
+    $new = @($want | Where-Object { $have -notcontains $_ })
+    $gone = @($have | Where-Object { $want -notcontains $_ })
+    if (-not $new.Count -and -not $gone.Count) { return $false }
+    if ($new.Count) { Write-AicLog "$($State.Name): denying new networks: $($new -join ', ')" -Level Info }
+    if ($gone.Count) { Write-AicLog "$($State.Name): networks no longer routed: $($gone -join ', ')" -Level Debug }
+    Set-AicIsolation -VmName $State.Name -Isolation 'Strict'
+    return $true
 }
 
 function Get-AicSwitchAdapter {
@@ -1358,7 +1429,7 @@ function Set-AicIsolation {
         return
     }
     $ranges = Get-AicDenyRanges
-    Write-AicLog "Isolation: Strict - $($ranges.Count) deny rules (all LAN ranges except $(Get-AicHostIp))" -Level Debug
+    Write-AicLog "Isolation: Strict - $($ranges.Count) deny rules (all LAN ranges except $(Get-AicHostIp), routed public networks, BlockRanges)" -Level Debug
     foreach ($r in $ranges) {
         Write-AicLog "Add-VMNetworkAdapterAcl -VMName $VmName -Direction Both -Action Deny -RemoteIPAddress $r" -Level Cmd
         Add-VMNetworkAdapterAcl -VMName $VmName -Direction Both -Action Deny -RemoteIPAddress $r
@@ -1476,6 +1547,11 @@ function Set-AicPortForward {
 # ---- Private/Share.ps1 ----------------------------------------------------------------
 # Shared folder: a locked-down local account per VM that can open only that VM's share.
 
+function Test-AicHasShare($State) {
+    # A VM made without a shared folder (or whose folder was taken away) sees nothing of the laptop.
+    return [bool]($State.PSObject.Properties['SharedFolder'] -and $State.SharedFolder)
+}
+
 $script:AicDenyRights = @('SeDenyInteractiveLogonRight', 'SeDenyRemoteInteractiveLogonRight', 'SeDenyBatchLogonRight', 'SeDenyServiceLogonRight')
 
 function Assert-AicSafeFolder {
@@ -1489,6 +1565,55 @@ function Assert-AicSafeFolder {
     }
     if ($full -like "$env:SystemRoot\*") { throw "Refusing to share a folder inside Windows ($full)." }
     return $full
+}
+
+function Get-AicShareWarnings {
+    <#
+    .SYNOPSIS
+    Red flags for a folder about to be shared with a VM: Terrarium itself inside it, a synced cloud
+    folder, a whole personal folder, or files that usually hold secrets. Nothing is refused - the
+    window asks once more, the log keeps the warnings.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $full = try { [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($Path)).TrimEnd('\') } catch { return @() }
+    $inside = { param($Outer, $Inner) $Outer = "$Outer".TrimEnd('\'); $Outer -and ($Inner -ieq $Outer -or $Inner -like "$Outer\*") }
+    $out = @()
+
+    $tool = $script:AicToolRootValue.TrimEnd('\')
+    if (& $inside $full $tool) { $out += "it contains Terrarium itself ($tool). The AI could change Terrarium.ps1, which you start as Administrator." }
+    elseif (Test-Path -LiteralPath $full) {
+        $copy = Get-ChildItem -LiteralPath $full -Filter 'Terrarium.ps1' -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($copy) { $out += "it contains a copy of Terrarium ($($copy.FullName)). Never start that one: the AI can change it." }
+    }
+    if (& $inside $full $script:AicHome) { $out += "it contains Terrarium's data ($script:AicHome): keys, VM disks, settings." }
+
+    $cloud = @($env:OneDrive, $env:OneDriveCommercial, $env:OneDriveConsumer) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($c in $cloud) {
+        if ((& $inside $c $full) -or (& $inside $full $c)) { $out += "it is synced to the cloud ($c): the AI's changes - and deletions - reach every synced device."; break }
+    }
+    if (-not ($out -match 'synced') -and $full -match '\\(Dropbox|Google Drive|My Drive|iCloudDrive|Box)(\\|$)') {
+        $out += "it looks like a cloud-synced folder ($($Matches[1])): the AI's changes - and deletions - reach every synced device."
+    }
+
+    $personal = @([Environment]::GetFolderPath('MyDocuments'), [Environment]::GetFolderPath('Desktop'), (Join-Path $env:USERPROFILE 'Downloads'),
+        [Environment]::GetFolderPath('MyPictures'), (Join-Path $env:USERPROFILE 'AppData')) | Where-Object { $_ }
+    foreach ($pf in $personal) {
+        if (& $inside $full $pf) { $out += "it is or contains your $(Split-Path $pf -Leaf) folder. Share a project folder instead." }
+    }
+
+    if (Test-Path -LiteralPath $full) {
+        # A quick look three levels deep for what usually holds secrets.
+        $names = '.ssh', '.aws', '.azure', '.kube', '.gnupg', '.docker', '.git-credentials', '.npmrc', '.pypirc', '.netrc', '.env', 'id_rsa', 'id_ed25519', 'id_ecdsa'
+        $exts = '.kdbx', '.pfx', '.p12', '.pem', '.key', '.ovpn'
+        $hits = @(Get-ChildItem -LiteralPath $full -Recurse -Depth 3 -Force -ErrorAction SilentlyContinue | Select-Object -First 20000 |
+            Where-Object { $names -contains $_.Name -or $_.Name -like '.env.*' -or (-not $_.PSIsContainer -and $exts -contains $_.Extension) } |
+            Where-Object { $_.FullName -notlike '*\node_modules\*' } | Select-Object -First 6)
+        if ($hits.Count) {
+            $list = ($hits | ForEach-Object { $_.FullName.Substring($full.Length).TrimStart('\') }) -join ', '
+            $out += "it holds files that often contain passwords or keys: $list. The AI can read and send them."
+        }
+    }
+    return $out
 }
 
 function New-AicShare {
@@ -1584,6 +1709,51 @@ echo "shared folder mounted again"
     }
 }
 
+function Add-AicVmShare {
+    # Gives a VM made without a shared folder one: account, share and firewall rule on the laptop,
+    # then the password and the mount in the running VM (as at the first boot).
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$Folder, [bool]$ReadOnly)
+    $State | Add-Member -NotePropertyName SharedFolder -NotePropertyValue $Folder -Force
+    $State | Add-Member -NotePropertyName SharedReadOnly -NotePropertyValue $ReadOnly -Force
+    Set-AicNoShareRule -State $State
+    $pw = New-AicShare -State $State
+    Save-AicState $State
+    $ro = if ($ReadOnly) { '1' } else { '0' }
+    Invoke-AicSsh -State $State -Script @"
+set -e
+sudo -n true 2>/dev/null || { echo 'sudo needs a password in this VM - cannot add the shared folder'; exit 1; }
+sudo bash -s <<'AICAGE'
+USER_NAME='$($State.User)'; HOST_IP='$(Get-AicHostIp)'; SHARE='$($State.ShareName)'; RO='$ro'
+log() { echo "aicage: `$*"; }
+(umask 077; printf 'username=%s\npassword=%s\n' '$($State.ShareAccount)' '$pw' > /root/.smb-aicage)
+$script:AicMountScript
+AICAGE
+"@ | Out-Null
+    Test-AicShareRoundTrip -State $State
+}
+
+function Remove-AicVmShare {
+    # Takes the shared folder away: the laptop side always, the mount in the VM when it runs.
+    param([Parameter(Mandatory)]$State, [bool]$Running)
+    Remove-AicShare -State $State
+    if ($Running) {
+        Invoke-AicSsh -State $State -Script @'
+set -e
+sudo -n true 2>/dev/null || { echo 'sudo needs a password - the mount entry stays (it cannot log in any more)'; exit 0; }
+sudo umount -l /mnt/shared 2>/dev/null || true
+sudo sed -i '\| /mnt/shared cifs |d' /etc/fstab
+sudo systemctl daemon-reload
+sudo rm -f /root/.smb-aicage
+[ -L "$HOME/shared" ] && rm -f "$HOME/shared"
+echo "shared folder removed"
+'@ | Out-Null
+    } else { Write-AicLog 'The VM is off: its mount entry stays, but the account behind it is gone' -Level Debug }
+    $State.SharedFolder = $null
+    $State.SharedReadOnly = $false
+    Save-AicState $State
+    Set-AicNoShareRule -State $State
+}
+
 function New-AicShareFirewallRule {
     param([Parameter(Mandatory)]$State)
     $ruleName = "AICage-SMB-$($State.Name)"
@@ -1594,11 +1764,28 @@ function New-AicShareFirewallRule {
         -RemoteAddress $State.Ip -Profile Any | Out-Null
 }
 
+function Set-AicNoShareRule {
+    # A VM without a shared folder must not reach the laptop's file sharing at all. Windows' own
+    # "File and Printer Sharing" rules may allow TCP 445 on every network; a block rule for the
+    # VM's address wins over any allow rule. With a shared folder the rule is removed again.
+    param([Parameter(Mandatory)]$State)
+    $name = "AICage-NoSMB-$($State.Name)"
+    $rule = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+    if (Test-AicHasShare $State) {
+        if ($rule) { Write-AicLog "Remove firewall rule $name (the VM has a shared folder now)" -Level Cmd; $rule | Remove-NetFirewallRule }
+    } elseif (-not $rule) {
+        Write-AicLog "New-NetFirewallRule $name`: block TCP 445 from $($State.Ip) (no shared folder)" -Level Cmd
+        New-NetFirewallRule -Name $name -DisplayName "Terrarium - no file sharing for VM $($State.Name)" -Group 'Terrarium' `
+            -Direction Inbound -Action Block -Protocol TCP -LocalPort 445 -RemoteAddress $State.Ip -Profile Any | Out-Null
+    }
+}
+
 function Remove-AicShare {
     # Tolerant of partial setups: each piece is removed if it exists.
     param([Parameter(Mandatory)]$State)
-    $rule = Get-NetFirewallRule -Name "AICage-SMB-$($State.Name)" -ErrorAction SilentlyContinue
-    if ($rule) { Write-AicLog "Remove firewall rule $($rule.Name)" -Level Cmd; $rule | Remove-NetFirewallRule }
+    foreach ($rule in @(Get-NetFirewallRule -Name "AICage-SMB-$($State.Name)", "AICage-NoSMB-$($State.Name)" -ErrorAction SilentlyContinue)) {
+        Write-AicLog "Remove firewall rule $($rule.Name)" -Level Cmd; $rule | Remove-NetFirewallRule
+    }
 
     if (Get-SmbShare -Name $State.ShareName -ErrorAction SilentlyContinue) {
         Write-AicLog "Remove-SmbShare $($State.ShareName)" -Level Cmd
@@ -1611,7 +1798,7 @@ function Remove-AicShare {
         $sid = $user.SID.Value
         Write-AicLog "Remove user rights and account $($State.ShareAccount)" -Level Cmd
         [AiCage.Native.Lsa]::RemoveAllRights($sid)
-        if (Test-Path -LiteralPath $State.SharedFolder) {
+        if ((Test-AicHasShare $State) -and (Test-Path -LiteralPath $State.SharedFolder)) {
             Invoke-AicNative -FilePath 'icacls.exe' -ArgumentList @($State.SharedFolder, '/remove', "*$sid") -Quiet -OkExitCodes 0, 1332 | Out-Null
         }
         Remove-LocalUser -SID $user.SID
@@ -1852,11 +2039,15 @@ function Start-AicPutty {
 # ---- Remote Desktop -------------------------------------------------------------------------
 # The VM's desktop (xrdp) in Windows' Remote Desktop, with a .rdp file that shares nothing of
 # this laptop: no drives, printers, devices - and no clipboard, which often holds passwords.
-# (Set redirectclipboard:i:1 in the file if you want copy and paste.) Sound plays on the laptop
-# only when the VM's Sound setting is on; the microphone is never shared.
+# Sound and the clipboard follow the VM's Sound and Clipboard settings; the microphone is never
+# shared.
 
 function Test-AicSound($State) {
     return [bool]($State.PSObject.Properties['Sound'] -and $State.Sound)
+}
+
+function Test-AicClipboard($State) {
+    return [bool]($State.PSObject.Properties['Clipboard'] -and $State.Clipboard)
 }
 
 function Start-AicDesktop {
@@ -1871,10 +2062,11 @@ function Start-AicDesktop {
         )
         Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
     }
-    # audiomode 0 plays the VM's sound here, 2 drops it. Only this line follows the setting, so
-    # other edits to the file stay.
+    # audiomode 0 plays the VM's sound here, 2 drops it; redirectclipboard 1 shares the clipboard
+    # both ways. Only these lines follow the VM's settings, so other edits to the file stay.
     $audio = if (Test-AicSound $State) { 'audiomode:i:0' } else { 'audiomode:i:2' }
-    $lines = @(Get-Content -LiteralPath $rdp -Encoding Unicode | Where-Object { $_ -notmatch '^audiomode:' }) + $audio
+    $clip = if (Test-AicClipboard $State) { 'redirectclipboard:i:1' } else { 'redirectclipboard:i:0' }
+    $lines = @(Get-Content -LiteralPath $rdp -Encoding Unicode | Where-Object { $_ -notmatch '^(audiomode|redirectclipboard):' }) + $audio + $clip
     Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
     Write-AicLog "mstsc.exe $rdp  (log in as $($State.User) with your Linux password)" -Level Debug
     Start-Process -FilePath 'mstsc.exe' -ArgumentList "`"$rdp`""
@@ -1973,6 +2165,19 @@ function Test-AicHost {
         }
     }
 
+    if ((Test-AicAdmin) -and (Get-Module -ListAvailable -Name Hyper-V)) {
+        # The laptop's routes change with VPNs: bring every VM's network filter up to date.
+        $done = @()
+        foreach ($st in @(Get-AicState)) {
+            $upd = @(Update-AicProtection -State $st)
+            if ($upd.Count) { $done += "$($st.Name): $($upd -join ', ')" }
+        }
+        $routed = @(Get-AicRoutedRanges)
+        $what = if ($routed.Count) { "$($routed.Count) routed public network(s) denied too" } else { 'private ranges denied' }
+        if ($done.Count) { Add-Check 'VM protection' PASS "updated - $($done -join '; ')" }
+        else { Add-Check 'VM protection' PASS "up to date ($what)" }
+    }
+
     if (Test-AicAdmin) {
         $left = @()
         try { $left = @(Get-AicLeftovers) } catch { }
@@ -2015,14 +2220,15 @@ function Show-AiCage {
 
   Test-AicHost                     check this laptop (run first)
   Enable-AicHyperV                 turn on Hyper-V (then restart Windows)
-  New-AicVm -Name agent1           create a VM (asks for the Linux password)
+  New-AicVm -Name agent1           create a VM (asks for the Linux password; -NoSharedFolder: no folder)
   Get-AicVm                        list VMs: state, address, memory
   Connect-AicVm agent1             open an SSH terminal into the VM
   Connect-AicVm agent1 -With PuTTY the same in PuTTY (-With Desktop: the graphical desktop)
   Test-AicVm agent1                check the isolation from inside the VM
   Debug-AicVm agent1               why the VM does not answer (or did not, before a restart)
   Set-AicVm agent1 -MemoryMaxMB 3072 -AutoStart $false
-  Set-AicVm agent1 -SharedFolder D:\Work\agent1   change the shared folder
+  Set-AicVm agent1 -SharedFolder D:\Work\agent1   change the shared folder (-NoSharedFolder: none)
+  Set-AicVm agent1 -Clipboard $true   copy and paste with the desktop (both ways)
   Set-AicVm agent1 -Ports 8080,3000:80   localhost:8080 on this laptop -> port 8080 in the VM
   Install-AicTool agent1 -Tool Desktop   add Docker, ClaudeCode, Codex or Desktop later
   Start-AicVm / Stop-AicVm / Restart-AicVm agent1   (Restart-AicVm -Force: hard reset)
@@ -2070,6 +2276,8 @@ function Invoke-AicVmCheck {
         Wait-AicSsh -State $State -TimeoutSeconds 60
     }
 
+    $upd = @(Update-AicProtection -State $State)
+    if ($upd.Count) { Write-AicLog "Updated: $($upd -join ', ')" -Level Info }
     $results = Invoke-AicStep 'Isolation tests (from inside the VM)' { Invoke-AicIsolationTest -State $State }
     $bad = @($results | Where-Object { Test-AicSecurityFailure $_ })
     if ($bad.Count -and -not $NoRepair) {
@@ -2097,7 +2305,9 @@ function Repair-AicVm {
     Initialize-AicHostNetwork
     Set-AicIsolation -VmName $State.Name -Isolation $State.Isolation
     Set-VMNetworkAdapter -VMName $State.Name -DhcpGuard On -RouterGuard On
-    if (-not (Get-NetFirewallRule -Name "AICage-SMB-$($State.Name)" -ErrorAction SilentlyContinue)) { New-AicShareFirewallRule -State $State }
+    [void](Disable-AicHostInfo -State $State)
+    if ((Test-AicHasShare $State) -and -not (Get-NetFirewallRule -Name "AICage-SMB-$($State.Name)" -ErrorAction SilentlyContinue)) { New-AicShareFirewallRule -State $State }
+    Set-AicNoShareRule -State $State
 }
 
 function Test-AicQuarantined($State) { return [bool]($State.PSObject.Properties['Quarantined'] -and $State.Quarantined) }
@@ -2146,6 +2356,7 @@ function Invoke-AicIsolationTest {
     }
 
     $lan = if ($strict) { 'blocked' } else { 'any' }
+    $smb = if (Test-AicHasShare $s) { 'open' } else { 'blocked' }
     $script = @"
 HOST='$hostIp'; GW='$gw'; LANIP='$lanIp'; LAN='$lan'; OTHERS='$($others -join ' ')'
 r() { echo "RESULT|`$1|`$2|`$3"; }
@@ -2154,7 +2365,7 @@ png() { ping -c 2 -W 2 "`$1" >/dev/null 2>&1 && echo reachable || echo blocked; 
 code=`$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 https://deb.debian.org/debian/)
 [ "`$code" = 200 ] && r 'Internet (https://deb.debian.org)' ok ok || r 'Internet (https://deb.debian.org)' ok "http `$code"
 getent hosts debian.org >/dev/null && r 'DNS' ok ok || r 'DNS' ok fail
-r "Laptop `$HOST port 445 (shared folder)" open `$(tcp `$HOST 445)
+r "Laptop `$HOST port 445 (shared folder)" $smb `$(tcp `$HOST 445)
 r "Laptop `$HOST port 22 (SSH from the VM)" blocked `$(tcp `$HOST 22)
 r "Laptop `$HOST port 135 (RPC)" blocked `$(tcp `$HOST 135)
 r "Laptop `$HOST port 139 (NetBIOS)" blocked `$(tcp `$HOST 139)
@@ -2187,6 +2398,7 @@ exit 0
         [pscustomobject]@{ Test = $p[1]; Expected = $exp; Actual = $act; Status = $status }
     }
 
+    if (-not (Test-AicHasShare $s)) { return $results }
     try {
         Test-AicShareRoundTrip -State $s
         Write-AicLog 'PASS  Shared folder works in both directions' -Level Ok
@@ -2301,6 +2513,53 @@ function Install-AicTool {
 # ---- Public/Vm.ps1 --------------------------------------------------------------------
 $script:AicBasePackages = @('hyperv-daemons', 'cifs-utils', 'locales', 'git', 'curl', 'ca-certificates', 'tmux', 'htop', 'unzip')
 $script:AicGuestServiceId = '6C09BB55-D683-4DA0-8931-C9BF705F6480'   # "Guest Service Interface"; its display name is localized
+$script:AicKvpServiceId = '2A34B1C2-FD73-4043-8A5B-DD2159BC743F'     # "Key-Value Pair Exchange" (Data Exchange)
+
+function Disable-AicHostInfo {
+    # Hyper-V's Data Exchange service tells the VM this laptop's name, its domain and the Windows
+    # build (in /var/lib/hyperv/.kvp_pool_3). Terrarium needs none of it: switched off, and what a
+    # VM already got is deleted once it answers on SSH (state HostInfoHidden). -Fresh: a VM that has
+    # never booted, so there is nothing to delete. Returns $true when it changed something.
+    param([Parameter(Mandatory)]$State, [switch]$Fresh)
+    if ($State.PSObject.Properties['HostInfoHidden'] -and $State.HostInfoHidden) { return $false }
+    $changed = $false
+    $svc = @(Get-VMIntegrationService -VMName $State.Name -ErrorAction SilentlyContinue | Where-Object { $_.Id -like "*$script:AicKvpServiceId" -and $_.Enabled })
+    if ($svc.Count) {
+        Write-AicLog "Disable-VMIntegrationService 'Key-Value Pair Exchange' -VMName $($State.Name) (hides the laptop's name from the VM)" -Level Cmd
+        $svc | Disable-VMIntegrationService
+        $changed = $true
+    }
+    $cleared = [bool]$Fresh
+    if (-not $cleared -and (Get-VM -Name $State.Name).State -eq 'Running' -and (Test-AicTcpPort -Ip $State.Ip -Port 22)) {
+        try {
+            # Root needed; a VM whose sudo asks for a password keeps the old details (and is asked again).
+            $out = Invoke-AicSsh -State $State -Quiet -Script @'
+sudo -n true 2>/dev/null || { echo NOSUDO; exit 0; }
+sudo systemctl stop hv-kvp-daemon 2>/dev/null
+for f in /var/lib/hyperv/.kvp_pool_*; do [ -f "$f" ] && sudo truncate -s 0 "$f"; done
+echo CLEARED
+'@
+            $cleared = ($out -join ' ') -match 'CLEARED'
+            if ($cleared) { Write-AicLog "Deleted the laptop details the VM had received" -Level Debug }
+        } catch { Write-AicLog "Could not clear the laptop details already in the VM: $($_.Exception.Message)" -Level Warn }
+    }
+    if ($cleared) {
+        $State | Add-Member -NotePropertyName HostInfoHidden -NotePropertyValue $true -Force
+        if (-not $Fresh) { Save-AicState $State }
+        $changed = $true
+    }
+    return $changed
+}
+
+function Update-AicProtection {
+    # The protections that can change without anything being wrong: the network filter follows the
+    # laptop's routes, and older VMs lose the laptop's name. Quiet when nothing changed.
+    param([Parameter(Mandatory)]$State)
+    $changed = @()
+    try { if (Sync-AicIsolation -State $State) { $changed += 'network filter' } } catch { Write-AicLog "Network filter of $($State.Name): $($_.Exception.Message)" -Level Warn }
+    try { if (Disable-AicHostInfo -State $State) { $changed += 'laptop name hidden' } } catch { Write-AicLog "Data Exchange of $($State.Name): $($_.Exception.Message)" -Level Warn }
+    return $changed
+}
 
 function New-AicVm {
     <#
@@ -2322,6 +2581,7 @@ function New-AicVm {
         [ValidateRange(4, 2048)][int]$DiskGB = 30,
         [string]$SharedFolder,
         [switch]$SharedReadOnly,
+        [switch]$NoSharedFolder,
         [bool]$AutoStart = $true,
         [ValidateSet('Strict', 'Open')][string]$Isolation = 'Strict',
         [string]$TimeZone,
@@ -2330,6 +2590,7 @@ function New-AicVm {
         [ValidateSet('Docker', 'ClaudeCode', 'Codex', 'Desktop')][string[]]$Tools = @(),
         [string[]]$Ports = @(),
         [bool]$Sound = $false,
+        [bool]$Clipboard = $false,
         [ValidateSet('Home', 'Program')][string]$Location = 'Home',
         [string]$SetupScriptPath,
         [bool]$PasswordlessSudo = $true,
@@ -2361,13 +2622,17 @@ function New-AicVm {
     $setupScript = $null
     if ($SetupScriptPath) { $setupScript = Get-Content -LiteralPath $SetupScriptPath -Raw }
     if ((Get-AicLocations) -notcontains $Location) { $Location = 'Home' }
-    if (-not $SharedFolder) { $SharedFolder = Join-Path (Get-AicPath Shared -Location $Location) $Name }
-    $SharedFolder = Assert-AicSafeFolder $SharedFolder
+    if ($NoSharedFolder) { $SharedFolder = $null; $SharedReadOnly = $false }
+    else {
+        if (-not $SharedFolder) { $SharedFolder = Join-Path (Get-AicPath Shared -Location $Location) $Name }
+        $SharedFolder = Assert-AicSafeFolder $SharedFolder
+    }
     if (-not $TimeZone) { $TimeZone = Get-AicDefaultTimeZone }
     if (-not $Keyboard) { $Keyboard = Get-AicDefaultKeyboard }
 
     [void](Get-AicPath Data -Location $Location)   # before Start-AicLog, so it gets protected like the rest
     Start-AicLog "create-$Name"
+    if ($SharedFolder) { foreach ($w in @(Get-AicShareWarnings $SharedFolder)) { Write-AicLog "Shared folder: $w" -Level Warn } }
     $cfg = Get-AicConfig
     $total = [Diagnostics.Stopwatch]::StartNew()
 
@@ -2411,8 +2676,14 @@ function New-AicVm {
 
         $pub = Invoke-AicStep 'SSH key' { New-AicSshKey -Name $Name -Location $Location }
 
-        $sharePw = Invoke-AicStep "Shared folder $SharedFolder (account $($state.ShareAccount), share, firewall rule)" { New-AicShare -State $state }
-        Save-AicState $state
+        $sharePw = $null
+        if ($SharedFolder) {
+            $sharePw = Invoke-AicStep "Shared folder $SharedFolder (account $($state.ShareAccount), share, firewall rule)" { New-AicShare -State $state }
+            Save-AicState $state
+        } else {
+            Write-AicLog 'No shared folder: the VM sees no folder of this laptop and cannot reach its file sharing' -Level Info
+            Invoke-AicStep 'Firewall: no file sharing for this VM' { Set-AicNoShareRule -State $state }
+        }
 
         $iso = Join-Path $vmDir 'seed.iso'
         Invoke-AicStep 'First-boot configuration (cloud-init seed ISO)' {
@@ -2444,6 +2715,7 @@ function New-AicVm {
             Add-VMDvdDrive -VMName $Name -Path $iso
             Set-VMFirmware -VMName $Name -FirstBootDevice (Get-VMHardDiskDrive -VMName $Name | Select-Object -First 1)
             Get-VMIntegrationService -VMName $Name | Where-Object { $_.Id -like "*$script:AicGuestServiceId" } | Enable-VMIntegrationService
+            [void](Disable-AicHostInfo -State $state -Fresh)
             $startAction = if ($AutoStart) { 'Start' } else { 'Nothing' }
             Write-AicLog "Set-VM -AutomaticStartAction $startAction -AutomaticStartDelay 20 -AutomaticStopAction ShutDown -AutomaticCheckpointsEnabled `$false" -Level Cmd
             Set-VM -Name $Name -AutomaticStartAction $startAction -AutomaticStartDelay 20 -AutomaticStopAction ShutDown `
@@ -2472,10 +2744,9 @@ function New-AicVm {
             Remove-Item -LiteralPath $iso -Force
         }
 
-        if ($Sound) {
-            $state | Add-Member -NotePropertyName Sound -NotePropertyValue $true -Force
-            Save-AicState $state
-        }
+        if ($Sound) { $state | Add-Member -NotePropertyName Sound -NotePropertyValue $true -Force }
+        if ($Clipboard) { $state | Add-Member -NotePropertyName Clipboard -NotePropertyValue $true -Force }
+        Save-AicState $state
 
         if ($Tools.Count) {
             $failedTools = @(Install-AicToolCore -State $state -Tool $Tools)
@@ -2506,7 +2777,8 @@ function New-AicVm {
         else { Write-AicLog ('VM {0} is ready in {1:n0} min {2:n0} s.' -f $Name, [math]::Floor($total.Elapsed.TotalMinutes), $total.Elapsed.Seconds) -Level Ok }
         Write-AicLog "  Connect:        Connect-AicVm $Name    (or: ssh -F `"$sshCfg`" $Name)" -Level Info
         Write-AicLog "  PuTTY:          host $($state.Ip), user $User, your password" -Level Info
-        Write-AicLog "  Shared folder:  $SharedFolder  =  ~/shared in the VM" -Level Info
+        if ($SharedFolder) { Write-AicLog "  Shared folder:  $SharedFolder  =  ~/shared in the VM" -Level Info }
+        else { Write-AicLog '  Shared folder:  none (Settings can add one)' -Level Info }
         Write-AicLog "  Log:            $(Get-AicLogPath)" -Level Info
         return Get-AicVm -Name $Name
     } catch {
@@ -2636,6 +2908,7 @@ function Get-AicVm {
                 Tools        = @(Get-AicInstalledTool $s)
                 Ports        = @(Get-AicPortForward $s)
                 Sound        = Test-AicSound $s
+                Clipboard    = Test-AicClipboard $s
             }
         }
     }
@@ -2651,6 +2924,11 @@ function Set-AicVm {
     reach them as localhost:8080; the local network does not. @() removes all forwards.
     .PARAMETER Sound
     Plays the desktop's sound on this laptop (from the next Remote Desktop connection on).
+    .PARAMETER Clipboard
+    Copy and paste between this laptop and the desktop, both ways (from the next connection on).
+    .PARAMETER NoSharedFolder
+    Takes the shared folder away: the VM then sees no folder of this laptop. -SharedFolder adds
+    one again (the VM must be running).
     .NOTES
     Processor count and startup memory need the VM off; the rest works while it runs.
     #>
@@ -2665,8 +2943,10 @@ function Set-AicVm {
         [ValidateSet('Strict', 'Open')][string]$Isolation,
         [string]$SharedFolder,
         [bool]$SharedReadOnly,
+        [switch]$NoSharedFolder,
         [AllowEmptyCollection()][string[]]$Ports,
-        [bool]$Sound
+        [bool]$Sound,
+        [bool]$Clipboard
     )
     process {
         Assert-AicReady
@@ -2702,12 +2982,21 @@ function Set-AicVm {
             $s.Isolation = $Isolation
             Save-AicState $s
         }
-        if ($PSBoundParameters.ContainsKey('SharedFolder') -or $PSBoundParameters.ContainsKey('SharedReadOnly')) {
+        if ($NoSharedFolder) {
+            if (Test-AicHasShare $s) { Invoke-AicStep 'Shared folder: none' { Remove-AicVmShare -State $s -Running ($vm.State -eq 'Running') } }
+        } elseif ($PSBoundParameters.ContainsKey('SharedFolder') -or $PSBoundParameters.ContainsKey('SharedReadOnly')) {
             $folder = if ($SharedFolder) { Assert-AicSafeFolder $SharedFolder } else { $s.SharedFolder }
             $ro = if ($PSBoundParameters.ContainsKey('SharedReadOnly')) { $SharedReadOnly } else { [bool]$s.SharedReadOnly }
-            # Read-only is also set in the VM's mount; with the VM off that cannot be changed.
-            if ($vm.State -ne 'Running' -and $ro -ne [bool]$s.SharedReadOnly) { throw 'Start the VM to switch read-only on or off.' }
-            Invoke-AicStep "Shared folder: $folder$(if ($ro) { ' (read-only)' })" { Set-AicShareFolder -State $s -Folder $folder -ReadOnly $ro -Running ($vm.State -eq 'Running') }
+            if ($SharedFolder) { foreach ($w in @(Get-AicShareWarnings $folder)) { Write-AicLog "Shared folder: $w" -Level Warn } }
+            if (-not (Test-AicHasShare $s)) {
+                if (-not $folder) { throw "$Name has no shared folder - name one with -SharedFolder." }
+                if ($vm.State -ne 'Running') { throw 'Start the VM to give it a shared folder.' }
+                Invoke-AicStep "Shared folder: $folder$(if ($ro) { ' (read-only)' })" { Add-AicVmShare -State $s -Folder $folder -ReadOnly $ro }
+            } else {
+                # Read-only is also set in the VM's mount; with the VM off that cannot be changed.
+                if ($vm.State -ne 'Running' -and $ro -ne [bool]$s.SharedReadOnly) { throw 'Start the VM to switch read-only on or off.' }
+                Invoke-AicStep "Shared folder: $folder$(if ($ro) { ' (read-only)' })" { Set-AicShareFolder -State $s -Folder $folder -ReadOnly $ro -Running ($vm.State -eq 'Running') }
+            }
         }
         if ($PSBoundParameters.ContainsKey('Ports')) {
             $list = @(ConvertTo-AicPortList $Ports)
@@ -2720,6 +3009,11 @@ function Set-AicVm {
             Save-AicState $s
             Write-AicLog "Desktop sound: $(if ($Sound) { 'on' } else { 'off' }) (from the next Remote Desktop connection)" -Level Ok
         }
+        if ($PSBoundParameters.ContainsKey('Clipboard')) {
+            $s | Add-Member -NotePropertyName Clipboard -NotePropertyValue $Clipboard -Force
+            Save-AicState $s
+            Write-AicLog "Desktop clipboard: $(if ($Clipboard) { 'on - both ways' } else { 'off' }) (from the next Remote Desktop connection)" -Level Ok
+        }
         Get-AicVm -Name $Name
     }
 }
@@ -2730,9 +3024,11 @@ function Start-AicVm {
     process {
         Assert-AicReady
         $s = Get-AicState1 -Name $Name
+        try { [void](Sync-AicIsolation -State $s) } catch { Write-AicLog "Network filter: $($_.Exception.Message)" -Level Warn }
         Write-AicLog "Start-VM $Name" -Level Cmd
         Start-VM -Name $Name
         if ($Wait) { Wait-AicSsh -State $s -TimeoutSeconds 180; Write-AicLog "$Name is up at $($s.Ip)" -Level Ok }
+        try { [void](Disable-AicHostInfo -State $s) } catch { Write-AicLog "Data Exchange: $($_.Exception.Message)" -Level Warn }
     }
 }
 
@@ -2993,7 +3289,8 @@ function Remove-AicVm {
                 Write-AicLog "deleted $dir" -Level Debug
             }
         }
-        if ($DeleteSharedFolder) {
+        if (-not (Test-AicHasShare $s)) { }
+        elseif ($DeleteSharedFolder) {
             & $try "Shared folder $($s.SharedFolder)" {
                 if (Test-Path -LiteralPath $s.SharedFolder) { Remove-Item -LiteralPath $s.SharedFolder -Recurse -Force }
             }
@@ -3069,7 +3366,7 @@ function Move-AicVm {
         [void](Update-AicSshConfig)
         $where = if ($To -eq 'Home') { 'your user folder' } else { 'the program folder' }
         Write-AicLog "$Name is now stored in $where ($newDir)." -Level Ok
-        Write-AicLog "Shared folder unchanged: $($s.SharedFolder)" -Level Info
+        if (Test-AicHasShare $s) { Write-AicLog "Shared folder unchanged: $($s.SharedFolder)" -Level Info }
     }
 }
 
@@ -3241,6 +3538,13 @@ $mainXaml = @'
             <GridViewColumn Header="Starts with Windows" Width="130" DisplayMemberBinding="{Binding AutoStart}"/>
             <GridViewColumn Header="Network" Width="75" DisplayMemberBinding="{Binding Isolation}"/>
             <GridViewColumn Header="Ports (localhost)" Width="110" DisplayMemberBinding="{Binding Ports}"/>
+            <GridViewColumn Header="Risks" Width="190">
+              <GridViewColumn.CellTemplate>
+                <DataTemplate>
+                  <TextBlock Text="{Binding Risks}" Foreground="#9A6700" ToolTip="Settings that give this VM more than the safe defaults - SECURITY.md explains each"/>
+                </DataTemplate>
+              </GridViewColumn.CellTemplate>
+            </GridViewColumn>
             <GridViewColumn Header="Shared folder" Width="260" DisplayMemberBinding="{Binding SharedFolder}"/>
             <GridViewColumn Header="Stored in" Width="200" DisplayMemberBinding="{Binding StoredIn}"/>
           </GridView>
@@ -3295,6 +3599,11 @@ $newXaml = @'
     <Style TargetType="TextBox"><Setter Property="Padding" Value="4,3"/></Style>
     <Style TargetType="ComboBox"><Setter Property="Padding" Value="6,3"/></Style>
     <Style TargetType="Button"><Setter Property="Padding" Value="12,4"/></Style>
+    <!-- What an option opens up for the VM; see SECURITY.md. -->
+    <Style TargetType="TextBlock" x:Key="Risk" BasedOn="{StaticResource Hint}">
+      <Setter Property="Foreground" Value="#9A6700"/>
+    </Style>
+    <BooleanToVisibilityConverter x:Key="B2V"/>
   </Window.Resources>
   <StackPanel Margin="20,16,20,16">
     <Grid>
@@ -3323,12 +3632,19 @@ $newXaml = @'
 
       <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Shared folder"/>
       <StackPanel Grid.Row="2" Grid.Column="1">
-        <DockPanel>
-          <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
-          <TextBox x:Name="FolderBox"/>
-        </DockPanel>
-        <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
-        <TextBlock Style="{StaticResource Hint}" Text="The only folder of this laptop the VM can see (as ~/shared). Put nothing there the AI must not read."/>
+        <CheckBox x:Name="ShareBox" Content="Share a folder of this laptop with the VM" IsChecked="True" Margin="0,0,0,6"/>
+        <StackPanel IsEnabled="{Binding IsChecked, ElementName=ShareBox}">
+          <DockPanel>
+            <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
+            <TextBox x:Name="FolderBox"/>
+          </DockPanel>
+          <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
+          <TextBlock Style="{StaticResource Hint}" Text="The only folder of this laptop the VM can see (as ~/shared). Put nothing there the AI must not read."/>
+          <TextBlock x:Name="FolderWarn" Style="{StaticResource Risk}" Foreground="#C62828" Visibility="Collapsed"/>
+          <TextBlock Style="{StaticResource Risk}" Text="Risk: what the AI writes here can run on Windows when you open or use it - scripts, shortcuts, git hooks, VS Code tasks. Treat it like a download from the internet. Read-only is safer."/>
+        </StackPanel>
+        <TextBlock x:Name="NoShareHint" Style="{StaticResource Hint}" Visibility="Collapsed"
+                   Text="No shared folder: the VM sees no file of this laptop and cannot reach its file sharing at all. Settings can add one later."/>
       </StackPanel>
 
       <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Linux user"/>
@@ -3337,7 +3653,7 @@ $newXaml = @'
       <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Password"/>
       <StackPanel Grid.Row="6" Grid.Column="1">
         <TextBox x:Name="PassBox"/>
-        <TextBlock Style="{StaticResource Hint}" Text="For sudo, PuTTY and the Desktop. The Terminal button logs in with a key, no password needed."/>
+        <TextBlock Style="{StaticResource Hint}" Text="For sudo, PuTTY and the Desktop. The Terminal button logs in with a key, no password needed. Every program on this laptop can try it over SSH - if others use this laptop, choose more than 'ai'."/>
       </StackPanel>
 
       <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Memory (MB)"/>
@@ -3366,12 +3682,15 @@ $newXaml = @'
       <StackPanel Grid.Row="14" Grid.Column="1">
         <RadioButton x:Name="StrictBox" GroupName="Iso" Content="Strict (recommended): internet only - no home, office or cowork network"/>
         <RadioButton x:Name="OpenBox" GroupName="Iso" Content="Open: the VM may also reach the local network" Margin="0,4,0,0"/>
+        <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=OpenBox, Converter={StaticResource B2V}}"
+                   Text="Risk: the AI can then reach your router, printers, NAS, smart devices and other computers - and the office network when you are there."/>
       </StackPanel>
 
       <TextBlock Grid.Row="16" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
       <StackPanel Grid.Row="16" Grid.Column="1">
         <TextBox x:Name="PortsBox"/>
         <TextBlock Style="{StaticResource Hint}" Text="Optional, e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop then reach the VM's services (e.g. Docker containers) as localhost:8080; the local network does not. TCP only."/>
+        <TextBlock Style="{StaticResource Risk}" Text="Risk: browsers treat all of localhost as one site - a page from the VM on localhost gets the cookies of your other local apps. To just look at a page, open http://&lt;VM address&gt;:&lt;port&gt; instead."/>
       </StackPanel>
     </Grid>
 
@@ -3396,9 +3715,16 @@ $newXaml = @'
             <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,0"/>
             <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,0"/>
             <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,0"/>
-            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,18,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,10,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+            <CheckBox x:Name="ClipBox" Content="with clipboard" Margin="0,0,18,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
           </WrapPanel>
           <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more). Desktop: a light graphical desktop with Firefox, opened with the Desktop button (Remote Desktop); about 1 GB. With sound, the VM's sound plays on this laptop (the microphone is never shared)."/>
+          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ToolDesktop, Converter={StaticResource B2V}}"
+                     Text="Desktop: Remote Desktop shares no drives or printers, and the clipboard only if you tick it. The VM can draw anything in that window - never type your Windows password there."/>
+          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=SoundBox, Converter={StaticResource B2V}}"
+                     Text="Risk (low): sound is one more data stream from the VM into Windows' Remote Desktop program. Leave it off unless you need it."/>
+          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ClipBox, Converter={StaticResource B2V}}"
+                     Text="Risk: the clipboard works both ways - the VM can read what you copy on Windows (often passwords) and put text into your clipboard."/>
         </StackPanel>
         <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
         <StackPanel Grid.Row="2" Grid.Column="1">
@@ -3459,6 +3785,11 @@ $settingsXaml = @'
     </Style>
     <Style TargetType="ComboBox"><Setter Property="Padding" Value="6,3"/></Style>
     <Style TargetType="Button"><Setter Property="Padding" Value="12,4"/></Style>
+    <!-- What an option opens up for the VM; see SECURITY.md. -->
+    <Style TargetType="TextBlock" x:Key="Risk" BasedOn="{StaticResource Hint}">
+      <Setter Property="Foreground" Value="#9A6700"/>
+    </Style>
+    <BooleanToVisibilityConverter x:Key="B2V"/>
   </Window.Resources>
   <StackPanel Margin="20,16,20,16">
     <TextBlock x:Name="TitleText" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
@@ -3493,20 +3824,30 @@ $settingsXaml = @'
       <StackPanel Grid.Row="6" Grid.Column="1">
         <RadioButton x:Name="StrictBox" GroupName="Iso" Content="Strict (recommended): internet only"/>
         <RadioButton x:Name="OpenBox" GroupName="Iso" Content="Open: may also reach the local network" Margin="0,4,0,0"/>
+        <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=OpenBox, Converter={StaticResource B2V}}"
+                   Text="Risk: the AI can then reach your router, printers, NAS, smart devices and other computers - and the office network when you are there."/>
       </StackPanel>
       <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Shared folder" VerticalAlignment="Top" Margin="0,4,10,0"/>
       <StackPanel Grid.Row="8" Grid.Column="1">
-        <DockPanel>
-          <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
-          <TextBox x:Name="FolderBox" Padding="4,3"/>
-        </DockPanel>
-        <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
-        <TextBlock x:Name="FolderHint" Style="{StaticResource Hint}" Text="The files stay where they are; the VM just sees the new folder as ~/shared."/>
+        <CheckBox x:Name="ShareBox" Content="Share a folder of this laptop with the VM" Margin="0,4,0,6"/>
+        <StackPanel IsEnabled="{Binding IsChecked, ElementName=ShareBox}">
+          <DockPanel>
+            <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
+            <TextBox x:Name="FolderBox" Padding="4,3"/>
+          </DockPanel>
+          <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
+          <TextBlock x:Name="FolderHint" Style="{StaticResource Hint}" Text="The files stay where they are; the VM just sees the new folder as ~/shared."/>
+          <TextBlock x:Name="FolderWarn" Style="{StaticResource Risk}" Foreground="#C62828" Visibility="Collapsed"/>
+          <TextBlock Style="{StaticResource Risk}" Text="Risk: what the AI writes here can run on Windows when you open or use it - scripts, shortcuts, git hooks, VS Code tasks. Read-only is safer."/>
+        </StackPanel>
+        <TextBlock x:Name="NoShareHint" Style="{StaticResource Hint}" Visibility="Collapsed"
+                   Text="No shared folder: the VM sees no file of this laptop and cannot reach its file sharing at all. Adding one needs the VM running."/>
       </StackPanel>
       <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
       <StackPanel Grid.Row="10" Grid.Column="1">
         <TextBox x:Name="PortsBox" Padding="4,3"/>
         <TextBlock Style="{StaticResource Hint}" Text="e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop reach them as localhost:8080; the local network does not. Empty: none."/>
+        <TextBlock Style="{StaticResource Risk}" Text="Risk: a page from the VM on localhost gets the cookies of your other local apps. To just look at a page, open http://&lt;VM address&gt;:&lt;port&gt; instead."/>
       </StackPanel>
     </Grid>
     <Expander Header="Advanced" Margin="0,14,0,0">
@@ -3526,9 +3867,14 @@ $settingsXaml = @'
             <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,4"/>
             <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,4"/>
             <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,4"/>
-            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,18,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,10,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+            <CheckBox x:Name="ClipBox" Content="with clipboard" Margin="0,0,18,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
           </WrapPanel>
           <TextBlock x:Name="ToolHint" Style="{StaticResource Hint}" Text="Tick what to add; it is installed when you click Apply (a few minutes)."/>
+          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=SoundBox, Converter={StaticResource B2V}}"
+                     Text="Risk (low): sound is one more data stream from the VM into Windows' Remote Desktop program. Leave it off unless you need it."/>
+          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ClipBox, Converter={StaticResource B2V}}"
+                     Text="Risk: the clipboard works both ways - the VM can read what you copy on Windows (often passwords) and put text into your clipboard."/>
         </StackPanel>
         <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
         <StackPanel Grid.Row="2" Grid.Column="1">
@@ -3701,8 +4047,8 @@ function Update-VmList {
     if ($script:HostOk) {
         try { $vms = @(Get-AicVm) } catch { }
     }
-    $sig = ($vms | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}|{12}|{13}' -f $_.Name, $_.State, $_.Status, $_.MemoryMB, $_.MemoryMinMB, $_.MemoryMaxMB, $_.Cpu, $_.AutoStart, $_.Isolation, $_.SharedFolder, $_.SharedReadOnly,
-        (Get-VmHealth $_), ($_.Ports -join ','), ($_.Tools -join ',') }) -join ';'
+    $sig = ($vms | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}|{12}|{13}|{14}' -f $_.Name, $_.State, $_.Status, $_.MemoryMB, $_.MemoryMinMB, $_.MemoryMaxMB, $_.Cpu, $_.AutoStart, $_.Isolation, $_.SharedFolder, $_.SharedReadOnly,
+        (Get-VmHealth $_), ($_.Ports -join ','), ($_.Tools -join ','), "$($_.Sound)$($_.Clipboard)" }) -join ';'
     if ($sig -eq $script:VmSignature) { Update-Buttons; return }
     $script:VmSignature = $sig
     $selected = Get-SelectedVm
@@ -3716,9 +4062,9 @@ function Update-VmList {
         $item = [pscustomobject]@{
             Name = $v.Name; State = $v.State; Health = $health; HealthBrush = $brush; Ip = $v.Ip
             Memory = "$mem  ($($v.MemoryMinMB)-$($v.MemoryMaxMB))"; Cpu = $v.Cpu
-            AutoStart = $(if ($v.AutoStart) { 'yes' } else { 'no' }); Isolation = $v.Isolation; SharedFolder = $v.SharedFolder
+            AutoStart = $(if ($v.AutoStart) { 'yes' } else { 'no' }); Isolation = $v.Isolation; SharedFolder = $(if ($v.SharedFolder) { $v.SharedFolder } else { '(none)' })
             Ports = (@($v.Ports | ForEach-Object { $h, $g = $_.Split(':'); if ($h -eq $g) { $h } else { "$h>$g" } }) -join ', ')
-            StoredIn = $(if ($v.Location -eq 'Program') { "program folder" } else { "user folder" }); Raw = $v
+            StoredIn = $(if ($v.Location -eq 'Program') { "program folder" } else { "user folder" }); Risks = (Get-VmRisks $v); Raw = $v
         }
         $script:VmItems.Add($item)
         if ($item.Name -eq $selName) { $ui.VmList.SelectedItem = $item }
@@ -3738,7 +4084,7 @@ function Update-Buttons {
     $ui.BtnStop.IsEnabled = -not $busy -and $running
     $ui.BtnTerminal.IsEnabled = $running
     $ui.BtnDesktop.IsEnabled = $running -and @($v.Raw.Tools) -contains 'Desktop'
-    $ui.BtnFolder.IsEnabled = [bool]$v
+    $ui.BtnFolder.IsEnabled = $v -and [bool]$v.Raw.SharedFolder
     $ui.BtnScreen.IsEnabled = $v -and -not $off
     $ui.BtnTest.IsEnabled = -not $busy -and $running
     $ui.BtnDiagnose.IsEnabled = -not $busy -and $v -and -not $off
@@ -3824,6 +4170,39 @@ $script:HostCpus = 4
 $script:ToolNames = @('Docker', 'ClaudeCode', 'Codex', 'Desktop')
 try { $script:HostCpus = [int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors } catch { }
 
+function Confirm-OpenNetwork([string]$Name) {
+    # Open is the one setting that lets the AI out of the cage onto the local network: ask once more.
+    $msg = "Open network for '$Name'?`n`nThe AI in this VM can then reach every device on the network this laptop is on: the router's admin page, printers, NAS, smart devices, other computers - and the office network when you are there.`n`nStrict (internet only) is the safe choice. Use Open only on a network with nothing to protect."
+    return [System.Windows.MessageBox]::Show($msg, 'Terrarium - Open network', 'YesNo', 'Warning') -eq 'Yes'
+}
+
+function Update-FolderWarning($K) {
+    # Red flags of the folder in the dialog (Terrarium inside, cloud sync, secrets), shown in red.
+    $w = @()
+    if ($K.ShareBox.IsChecked -and $K.FolderBox.Text.Trim()) { try { $w = @(Get-AicShareWarnings $K.FolderBox.Text.Trim()) } catch { } }
+    $K.FolderWarn.Text = ($w | ForEach-Object { "Warning: this folder - $_" }) -join "`n"
+    $K.FolderWarn.Visibility = if ($w.Count) { 'Visible' } else { 'Collapsed' }
+    $K.NoShareHint.Visibility = if ($K.ShareBox.IsChecked) { 'Collapsed' } else { 'Visible' }
+    return $w
+}
+
+function Confirm-ShareFolder([string]$Folder, [string[]]$Warnings) {
+    if (-not $Warnings.Count) { return $true }
+    $msg = "Share this folder with the VM?`n`n$Folder`n`n" + (($Warnings | ForEach-Object { "- $_" }) -join "`n`n") + "`n`nThe AI in the VM can read everything in it - and change it unless it is read-only."
+    return [System.Windows.MessageBox]::Show($msg, 'Terrarium - shared folder', 'YesNo', 'Warning') -eq 'Yes'
+}
+
+function Get-VmRisks($Vm) {
+    # Settings beyond the safe defaults, for the Risks column (SECURITY.md explains each).
+    $r = @()
+    if ($Vm.Isolation -eq 'Open') { $r += 'open network' }
+    if (@($Vm.Ports).Count) { $r += 'localhost ports' }
+    if ($Vm.Sound) { $r += 'sound' }
+    if ($Vm.Clipboard) { $r += 'clipboard' }
+    if ($Vm.SharedFolder -and -not $Vm.SharedReadOnly) { $r += 'writable share' }
+    return $r -join ', '
+}
+
 function Show-NewVmDialog {
     # Handlers use $script:Dlg: event handlers run in this script's scope, so state kept there is
     # reliable (GetNewClosure would move $script: variables into a separate module scope).
@@ -3831,7 +4210,8 @@ function Show-NewVmDialog {
     $d.Owner = $win
     $c = @{ Window = $d; Result = $null; FolderTouched = $false }
     foreach ($n in 'NameBox', 'BtnBrowse', 'FolderBox', 'ReadOnlyBox', 'UserBox', 'PassBox', 'MinMemBox', 'MaxMemBox', 'CpuBox',
-        'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'PortsBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel') {
+        'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'PortsBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'ClipBox', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel',
+        'ShareBox', 'FolderWarn', 'NoShareHint') {
         $c[$n] = $d.FindName($n)
     }
     $c.Existing = @($script:VmItems | ForEach-Object { $_.Name })
@@ -3871,8 +4251,10 @@ function Show-NewVmDialog {
         $f = New-Object System.Windows.Forms.FolderBrowserDialog
         $f.Description = 'Folder the VM may see as ~/shared'
         if (Test-Path -LiteralPath $k.FolderBox.Text) { $f.SelectedPath = $k.FolderBox.Text }
-        if ($f.ShowDialog() -eq 'OK') { $k.FolderBox.Text = $f.SelectedPath; $k.FolderTouched = $true }
+        if ($f.ShowDialog() -eq 'OK') { $k.FolderBox.Text = $f.SelectedPath; $k.FolderTouched = $true; [void](Update-FolderWarning $k) }
     })
+    $c.FolderBox.Add_LostFocus({ [void](Update-FolderWarning $script:Dlg) })
+    $c.ShareBox.Add_Click({ [void](Update-FolderWarning $script:Dlg) })
     $c.BtnScript.Add_Click({
         $f = New-Object System.Windows.Forms.OpenFileDialog
         $f.Filter = 'Shell scripts (*.sh)|*.sh|All files (*.*)|*.*'
@@ -3893,8 +4275,9 @@ function Show-NewVmDialog {
         elseif ($min -gt $max) { $errs += 'Memory: "at least" must not be more than "at most".' }
         $disk = Get-IntOrNull $k.DiskBox.Text
         if (-not $disk -or $disk -lt 4) { $errs += 'Disk: a number of GB, at least 4.' }
+        $share = [bool]$k.ShareBox.IsChecked
         $folder = $k.FolderBox.Text.Trim()
-        if (-not $folder) { $errs += 'Choose a shared folder.' }
+        if ($share -and -not $folder) { $errs += 'Choose a shared folder (or untick sharing).' }
         $scriptPath = $k.ScriptBox.Text.Trim()
         if ($scriptPath -and -not (Test-Path -LiteralPath $scriptPath)) { $errs += 'Setup script: file not found.' }
         $ports = @()
@@ -3907,7 +4290,7 @@ function Show-NewVmDialog {
         $p = @{
             Name = $name; User = $user; PasswordPlain = $k.PassBox.Text
             MemoryMinMB = $min; MemoryMaxMB = $max; MemoryStartupMB = [math]::Min([math]::Max(1024, $min), $max)
-            Cpu = [int]$k.CpuBox.Text; DiskGB = $disk; SharedFolder = $folder; SharedReadOnly = [bool]$k.ReadOnlyBox.IsChecked
+            Cpu = [int]$k.CpuBox.Text; DiskGB = $disk
             AutoStart = [bool]$k.AutoBox.IsChecked; Isolation = $(if ($k.OpenBox.IsChecked) { 'Open' } else { 'Strict' })
             Location = $(if ($k.LocProgramBox.IsChecked) { 'Program' } else { 'Home' })
         }
@@ -3916,10 +4299,14 @@ function Show-NewVmDialog {
         $tl = @($script:ToolNames | Where-Object { $k["Tool$_"].IsChecked })
         if ($tl.Count) { $p.Tools = $tl }
         if ($ports.Count) { $p.Ports = $ports }
+        if ($share) { $p.SharedFolder = $folder; $p.SharedReadOnly = [bool]$k.ReadOnlyBox.IsChecked } else { $p.NoSharedFolder = $true }
         if ($k.ToolDesktop.IsChecked -and $k.SoundBox.IsChecked) { $p.Sound = $true }
+        if ($k.ToolDesktop.IsChecked -and $k.ClipBox.IsChecked) { $p.Clipboard = $true }
         if ($scriptPath) { $p.SetupScriptPath = $scriptPath }
         if ($k.TzBox.Text.Trim()) { $p.TimeZone = $k.TzBox.Text.Trim() }
         if ($k.KbBox.Text.Trim()) { $p.Keyboard = $k.KbBox.Text.Trim() }
+        if ($p.Isolation -eq 'Open' -and -not (Confirm-OpenNetwork $name)) { return }
+        if ($share -and -not (Confirm-ShareFolder $folder @(Update-FolderWarning $k))) { return }
         $k.Result = $p
         $k.Window.DialogResult = $true
     })
@@ -3961,7 +4348,8 @@ function Show-SettingsDialog($Raw) {
     $d.Owner = $win
     $c = @{ Window = $d; Result = $null; Raw = $Raw }
     foreach ($n in 'TitleText', 'MinMemBox', 'MaxMemBox', 'CpuBox', 'CpuHint', 'AutoBox', 'StrictBox', 'OpenBox', 'FolderBox', 'BtnBrowse', 'ReadOnlyBox',
-        'FolderHint', 'PortsBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'ToolHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel') { $c[$n] = $d.FindName($n) }
+        'FolderHint', 'PortsBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'ClipBox', 'ToolHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel',
+        'ShareBox', 'FolderWarn', 'NoShareHint') { $c[$n] = $d.FindName($n) }
     $script:Dlg = $c
     $c.TitleText.Text = "Settings of $($Raw.Name)"
     Set-Combo $c.MinMemBox @(512, 1024, 2048, 4096) $Raw.MemoryMinMB
@@ -3970,15 +4358,24 @@ function Show-SettingsDialog($Raw) {
     if ($Raw.State -ne 'Off') { $c.CpuBox.IsEnabled = $false; $c.CpuHint.Visibility = 'Visible' }
     $c.AutoBox.IsChecked = [bool]$Raw.AutoStart
     if ($Raw.Isolation -eq 'Open') { $c.OpenBox.IsChecked = $true } else { $c.StrictBox.IsChecked = $true }
-    $c.FolderBox.Text = $Raw.SharedFolder
+    $c.HasShare = [bool]$Raw.SharedFolder
+    $c.ShareBox.IsChecked = $c.HasShare
+    $c.FolderBox.Text = if ($c.HasShare) { $Raw.SharedFolder } else { Join-Path (Join-Path $script:HomeRoot 'data\shared') $Raw.Name }
     $c.ReadOnlyBox.IsChecked = [bool]$Raw.SharedReadOnly
-    if ($Raw.State -ne 'Running') { $c.ReadOnlyBox.IsEnabled = $false }
+    if ($Raw.State -ne 'Running') {
+        $c.ReadOnlyBox.IsEnabled = $false
+        # Adding a folder sets up the mount inside the VM, over SSH.
+        if (-not $c.HasShare) { $c.ShareBox.IsEnabled = $false }
+    }
+    if (-not $c.HasShare) { $c.NoShareHint.Visibility = 'Visible' }
+    $c.FolderBox.Add_LostFocus({ [void](Update-FolderWarning $script:Dlg) })
+    $c.ShareBox.Add_Click({ [void](Update-FolderWarning $script:Dlg) })
     $c.BtnBrowse.Add_Click({
         $k = $script:Dlg
         $f = New-Object System.Windows.Forms.FolderBrowserDialog
         $f.Description = 'Folder the VM may see as ~/shared'
         if (Test-Path -LiteralPath $k.FolderBox.Text) { $f.SelectedPath = $k.FolderBox.Text }
-        if ($f.ShowDialog() -eq 'OK') { $k.FolderBox.Text = $f.SelectedPath }
+        if ($f.ShowDialog() -eq 'OK') { $k.FolderBox.Text = $f.SelectedPath; [void](Update-FolderWarning $k) }
     })
     if ($Raw.State -ne 'Running') { $c.FolderHint.Text += ' Start the VM to switch read-only on or off.' }
     $c.LocHomeBox.Content = "Your user folder:  $script:HomeRoot"
@@ -3987,6 +4384,7 @@ function Show-SettingsDialog($Raw) {
     if ($script:ProgramRoot -ieq $script:HomeRoot) { $c.LocProgramBox.Visibility = 'Collapsed' }
     $c.PortsBox.Text = @($Raw.Ports) -join ', '
     $c.SoundBox.IsChecked = [bool]$Raw.Sound
+    $c.ClipBox.IsChecked = [bool]$Raw.Clipboard
     # Installed programs stay ticked and greyed; the rest can be added (over SSH, so running only).
     foreach ($t in $script:ToolNames) {
         $box = $c["Tool$t"]
@@ -4009,14 +4407,26 @@ function Show-SettingsDialog($Raw) {
         if ($k.CpuBox.IsEnabled -and [int]$k.CpuBox.Text -ne $r.Cpu) { $p.Cpu = [int]$k.CpuBox.Text }
         if ([bool]$k.AutoBox.IsChecked -ne [bool]$r.AutoStart) { $p.AutoStart = [bool]$k.AutoBox.IsChecked }
         $iso = if ($k.OpenBox.IsChecked) { 'Open' } else { 'Strict' }
-        if ($iso -ne $r.Isolation) { $p.Isolation = $iso }
+        if ($iso -ne $r.Isolation) {
+            if ($iso -eq 'Open' -and -not (Confirm-OpenNetwork $r.Name)) { return }
+            $p.Isolation = $iso
+        }
         $folder = $k.FolderBox.Text.Trim()
-        if (-not $folder) { $k.ErrorText.Text = 'Choose a shared folder.'; $k.ErrorText.Visibility = 'Visible'; return }
-        if ($folder -ne $r.SharedFolder) { $p.SharedFolder = $folder }
-        if ([bool]$k.ReadOnlyBox.IsChecked -ne [bool]$r.SharedReadOnly) { $p.SharedReadOnly = [bool]$k.ReadOnlyBox.IsChecked }
+        if (-not $k.ShareBox.IsChecked) {
+            if ($k.HasShare) { $p.NoSharedFolder = $true }
+        } else {
+            if (-not $folder) { $k.ErrorText.Text = 'Choose a shared folder (or untick sharing).'; $k.ErrorText.Visibility = 'Visible'; return }
+            if (-not $k.HasShare -or $folder -ne $r.SharedFolder) {
+                if (-not (Confirm-ShareFolder $folder @(Update-FolderWarning $k))) { return }
+                $p.SharedFolder = $folder
+            }
+            if (-not $k.HasShare -or [bool]$k.ReadOnlyBox.IsChecked -ne [bool]$r.SharedReadOnly) { $p.SharedReadOnly = [bool]$k.ReadOnlyBox.IsChecked }
+        }
         if (($ports -join ',') -ne (@($r.Ports) -join ',')) { $p.Ports = $ports }
         $sound = [bool]($k.ToolDesktop.IsChecked -and $k.SoundBox.IsChecked)
         if ($sound -ne [bool]$r.Sound) { $p.Sound = $sound }
+        $clip = [bool]($k.ToolDesktop.IsChecked -and $k.ClipBox.IsChecked)
+        if ($clip -ne [bool]$r.Clipboard) { $p.Clipboard = $clip }
         $install = @($script:ToolNames | Where-Object { $k["Tool$_"].IsEnabled -and $k["Tool$_"].IsChecked })
         if ($install.Count) { $p.Install = $install }
         $loc = if ($k.LocProgramBox.IsChecked) { 'Program' } else { 'Home' }
@@ -4112,7 +4522,8 @@ $ui.BtnDesktop.Add_Click({
 
 $ui.BtnRemove.Add_Click({
     $v = Get-SelectedVm; if (-not $v) { return }
-    $msg = "Delete the VM '$($v.Name)'?`n`nIts disk, checkpoints and settings are deleted and cannot be restored.`nThe files in the shared folder are kept:`n$($v.SharedFolder)"
+    $msg = "Delete the VM '$($v.Name)'?`n`nIts disk, checkpoints and settings are deleted and cannot be restored."
+    if ($v.Raw.SharedFolder) { $msg += "`nThe files in the shared folder are kept:`n$($v.Raw.SharedFolder)" }
     if ([System.Windows.MessageBox]::Show($msg, 'Remove VM', 'YesNo', 'Warning') -ne 'Yes') { return }
     Start-Op -Title "Removing $($v.Name)" -Arg $v.Name -Script 'param($n) Remove-AicVm -Name $n -Force'
 })

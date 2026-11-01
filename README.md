@@ -21,7 +21,7 @@ https://github.com/user-attachments/assets/cb3d2f92-6332-47be-be5d-978e01c5d82f
 Full quality: [terrarium-intro.mp4](https://github.com/parvuselephantus/Terrarium/releases/download/v1.0.0/terrarium-intro.mp4)
 ([1.0.0 release](https://github.com/parvuselephantus/Terrarium/releases/tag/v1.0.0)).*
 
-Version 1.0.0.
+Version 1.0.1.
 
 ## Safety at a glance
 

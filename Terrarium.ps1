@@ -1,5 +1,5 @@
 <#
-Terrarium 1.0.0 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
+Terrarium 1.0.1 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
 (Formerly "AI Cage": internal names - the .aicage folder, the AICage switch, the Aic commands -
 keep the old name so existing VMs go on working.)
 Start it with Terrarium.cmd (it asks for Administrator rights).   Terrarium.cmd console = commands only.
@@ -158,7 +158,7 @@ $script:AicJournalSetup = 'mkdir -p /etc/systemd/journald.conf.d /var/log/journa
 # used at the first boot and when a shared folder is added later.
 $script:AicMountScript = @'
 uid=$(id -u "$USER_NAME"); gid=$(id -g "$USER_NAME")
-opts="credentials=/root/.smb-aicage,uid=$uid,gid=$gid,vers=3.1.1,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount"
+opts="credentials=/root/.smb-aicage,uid=$uid,gid=$gid,vers=3.1.1,file_mode=0775,dir_mode=0775,_netdev,nofail,x-systemd.automount"
 [ "$RO" = 1 ] && opts="ro,$opts"
 mkdir -p /mnt/shared
 grep -q " /mnt/shared " /etc/fstab || echo "//$HOST_IP/$SHARE /mnt/shared cifs $opts 0 0" >> /etc/fstab
@@ -321,7 +321,7 @@ function New-AicSeedIso {
 # settings) and the program folder ("Program"). Each VM is in one of them, chosen when it is
 # made; Terrarium looks in both. Root is the Home place ("Root" in config.json overrides it).
 
-$script:AicVersion = '1.0.0'
+$script:AicVersion = '1.0.1'
 
 # Terrarium.ps1 (the single-file build) passes the tool folder as $AicToolRoot; the module form
 # (development) finds it as the parent of the module folder.

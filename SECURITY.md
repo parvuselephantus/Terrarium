@@ -33,6 +33,7 @@ What Terrarium protects **from** the VM:
 | Your files outside the shared folder | Yes - the VM has no path to them |
 | Services on the laptop (RPC, NetBIOS, Remote Desktop, WinRM, anything listening) | Yes - firewall; only the shared folder's port 445 is open, and not even that without a shared folder |
 | Your home / office / cowork network (router, NAS, printers, other PCs) | Yes in *Strict* mode, **no** in *Open* mode |
+| Logins into the VM from other computers | Not possible, unless you turn on *SSH from the network* |
 | Company networks behind a split-tunnel VPN | Yes in *Strict* mode, once Terrarium has seen the VPN's routes |
 | The laptop's name, domain and Windows build | Yes - not passed to the VM |
 | Other VMs (Terrarium or not) | Yes - Hyper-V filter on the VM's network port |
@@ -124,18 +125,19 @@ an attacker. **Info** - worth knowing, no action needed.
 | 3 | [Secrets inside the VM](#secrets-inside-the-vm) | - | **High** | API keys and logins in the VM belong to the AI too |
 | 4 | [Open network](#open-network) | off | **High** | The AI reaches your LAN: router, NAS, printers, other PCs |
 | 5 | [Ports to this laptop](#ports-to-this-laptop) | none | **Medium** | `localhost` pages from the VM share cookies with your local apps |
-| 6 | [Copy and paste](#copy-and-paste) | off | **Medium** | *with clipboard*, or terminal escape codes, cross the wall |
-| 7 | [Windows' SMB server is reachable](#smb-server) | with a shared folder | **Medium** | Root in the VM can talk to the laptop's file-sharing service |
-| 8 | [Full-tunnel VPNs and public services](#full-tunnel-vpns-and-public-services) | always | **Medium** | What the laptop reaches through the internet, the VM reaches too |
-| 9 | [Desktop (Remote Desktop)](#desktop) | off | **Low** | The VM talks to Windows' Remote Desktop program and can draw fake dialogs |
-| 10 | [Desktop sound](#desktop-sound) | off | **Low** | One more data stream into Remote Desktop's audio code |
-| 11 | [Password and SSH](#password-and-ssh) | `ai` / `ai` | **Low** | Any program on the laptop can log in to the VM |
-| 12 | [Laptop details](#laptop-details) | hidden | **Info** | Laptop name, domain and Windows build are no longer passed to the VM |
-| 13 | [Hyper-V escape](#hyper-v-escape) | always | **Low** | A hypervisor bug would break the wall |
-| 14 | [Downloads during setup](#downloads-during-setup) | always | **Low** | Image and tools are trusted over HTTPS |
-| 15 | [Firewall depends on Windows](#firewall-depends-on-windows) | always | **Low** | A company policy can switch local firewall rules off |
-| 16 | [Start with Windows](#start-with-windows) | on | **Info** | An agent keeps working while you are not looking |
-| 17 | [Test and secure trusts the VM](#test-and-secure-trusts-the-vm) | - | **Info** | It finds mistakes, not a VM that lies |
+| 6 | [SSH from the network](#ssh-from-the-network) | off | **Medium** | Anyone on your network can try the VM's password; the AI controls what answers |
+| 7 | [Copy and paste](#copy-and-paste) | off | **Medium** | *with clipboard*, or terminal escape codes, cross the wall |
+| 8 | [Windows' SMB server is reachable](#smb-server) | with a shared folder | **Medium** | Root in the VM can talk to the laptop's file-sharing service |
+| 9 | [Full-tunnel VPNs and public services](#full-tunnel-vpns-and-public-services) | always | **Medium** | What the laptop reaches through the internet, the VM reaches too |
+| 10 | [Desktop (Remote Desktop)](#desktop) | off | **Low** | The VM talks to Windows' Remote Desktop program and can draw fake dialogs |
+| 11 | [Desktop sound](#desktop-sound) | off | **Low** | One more data stream into Remote Desktop's audio code |
+| 12 | [Password and SSH](#password-and-ssh) | `ai` / `ai` | **Low** | Any program on the laptop can log in to the VM |
+| 13 | [Laptop details](#laptop-details) | hidden | **Info** | Laptop name, domain and Windows build are no longer passed to the VM |
+| 14 | [Hyper-V escape](#hyper-v-escape) | always | **Low** | A hypervisor bug would break the wall |
+| 15 | [Downloads during setup](#downloads-during-setup) | always | **Low** | Image and tools are trusted over HTTPS |
+| 16 | [Firewall depends on Windows](#firewall-depends-on-windows) | always | **Low** | A company policy can switch local firewall rules off |
+| 17 | [Start with Windows](#start-with-windows) | on | **Info** | An agent keeps working while you are not looking |
+| 18 | [Test and secure trusts the VM](#test-and-secure-trusts-the-vm) | - | **Info** | It finds mistakes, not a VM that lies |
 
 The **Risks** column in Terrarium's window lists, per VM, the options from this table it has on
 (open network, localhost ports, sound, clipboard, writable share). The New VM and Settings
@@ -248,6 +250,38 @@ What helps: to just *look at* something the VM serves, open `http://<VM address>
 program really needs to reach as `localhost`, and remove forwards when done. Never forward port
 22 or 3389.
 
+### SSH from the network
+
+**Medium**, when you turn it on (Settings - Advanced, per VM). Windows' port proxy listens on the
+chosen port on every address of the laptop and passes connections to the VM's SSH (port 22). A
+firewall rule allows that port only from the laptop's own subnets (`LocalSubnet`) and only on
+networks Windows calls *Private* or *Domain*. What it does **not** change: the VM still cannot
+open connections into your network (*Strict*'s filter and the block rules stay), and the
+connections reach the VM from the laptop's VM-switch address, so the VM does not even learn the
+other computers' addresses.
+
+What it adds:
+
+- **Password guessing from the network.** Everyone on the same network - family, guests on the
+  Wi-Fi, colleagues, a compromised device - can try the Linux password; whoever gets in has a
+  shell in the VM with its internet (and the shared folder). Terrarium does not check the
+  password; the default `ai` is the first one anybody tries, so change it (`passwd` in the VM)
+  unless the network is only yours. Use one that you use nowhere else: the AI is root in the VM
+  and can read or change it.
+- **The AI controls the server.** As root it can replace the SSH server with anything: show a
+  fake login, collect the passwords people type, or send data that attacks the SSH client on the
+  other computer. Keep PuTTY up to date, check the host key the first time (Terrarium shows it),
+  and never type a password there that is not the VM's.
+- **Where the laptop goes, the port goes.** On another *Private* network (a friend's home, an
+  office you marked Private) its computers can try too. On *Public* networks the rule does not
+  apply. The port is open whenever Terrarium has it on, also with the VM stopped (nothing answers
+  then).
+- Other virtual networks of the laptop (WSL, Docker, Hyper-V's Default Switch) are usually
+  *Public*, so the rule does not apply there; Terrarium's own VMs are blocked by the block rules
+  in any case.
+
+Turn it off when you do not need it. *Remove* deletes the forward and the rule with the VM.
+
 ### Copy and paste
 
 **Medium**, when you turn it on.
@@ -290,7 +324,7 @@ connection.
 ### Password and SSH
 
 **Low.** The default Linux login is `ai` / `ai`, and SSH accepts passwords. The VM is reachable
-only from the laptop, so this mainly matters when **other people or untrusted programs** use the
+only from the laptop (unless you turn on [SSH from the network](#ssh-from-the-network)), so this mainly matters when **other people or untrusted programs** use the
 same Windows machine: any of them can log in to the VM. Choose a real password then. The
 Terminal button does not need the password (it uses the per-VM key). Passwordless `sudo` is the
 point of the cage: the AI may administer its VM.
@@ -382,7 +416,7 @@ Before you start an agent:
 - [ ] Network is **Strict**.
 - [ ] Only the ports you need; open pages at `http://<VM address>:<port>` when you just look.
 - [ ] API keys / tokens in the VM are separate, limited and revocable.
-- [ ] Sound off, clipboard off, unless you need them now.
+- [ ] Sound off, clipboard off, SSH from the network off, unless you need them now.
 - [ ] Windows is up to date.
 
 While and after it works:

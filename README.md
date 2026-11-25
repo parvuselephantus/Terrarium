@@ -21,7 +21,8 @@ https://github.com/user-attachments/assets/cb3d2f92-6332-47be-be5d-978e01c5d82f
 Full quality: [terrarium-intro.mp4](https://github.com/parvuselephantus/Terrarium/releases/download/v1.0.0/terrarium-intro.mp4)
 ([1.0.0 release](https://github.com/parvuselephantus/Terrarium/releases/tag/v1.0.0)).*
 
-Version 1.0.1.
+Version 1.1.0 - new: the [desktop size](#desktop) can be chosen, and [other computers on your
+network can log in](#ssh-from-other-computers) to a VM with PuTTY (off by default).
 
 ## Safety at a glance
 
@@ -34,6 +35,7 @@ safe what you *do* with the AI's files on Windows, or protect secrets you give t
 | Shared folder, writable | on | **High** | What the AI writes can run on Windows when you open or use it (scripts, shortcuts, git hooks, IDE tasks). Tick *read-only* when it only needs to read, or share no folder at all. |
 | What you share | your choice | **High** | Terrarium warns (in red, and asks again) when the folder contains Terrarium itself, is synced to the cloud, is a whole Documents/Desktop/Downloads, or holds keys and `.env` files. |
 | Network *Open* | off | **High** | The AI reaches your router, NAS, printers, other PCs, the office network. Terrarium asks before switching. |
+| SSH from the network | off | **Medium** | Anyone on your home or office network can try the VM's password. Only on networks Windows calls *Private*. Change the default password `ai` (`passwd` in the VM). |
 | Ports to this laptop | none | **Medium** | `localhost` pages from the VM share cookies with your other local apps. To just look, open `http://<VM address>:<port>`. |
 | Desktop *with clipboard* | off | **Medium** | Both ways: the VM can read what you copy (often passwords). |
 | Desktop | off | **Low** | The VM can draw a fake Windows dialog - never type your Windows password there. |
@@ -77,8 +79,15 @@ the protection; if that does not help, it disconnects the VM's network and tells
 ## Desktop
 
 *Desktop (XFCE)* installs a light graphical desktop with Firefox (about 1 GB). The **Desktop**
-button opens it in Windows' Remote Desktop; log in with the Linux user and password. The desktop
-resizes with the window. Remote Desktop shares nothing of your laptop with the VM - not even the
+button opens it in Windows' Remote Desktop; log in with the Linux user and password.
+
+**Size.** The small arrow next to **Desktop** (also *Desktop size* in **Settings** - *Advanced*)
+chooses how large the desktop is: *Fit this screen* (the default: a window as large as the
+screen allows, without the taskbar), *Full screen*, or a fixed size such as 1920 x 1080 - *Other
+size...* takes any. Windows' Remote Desktop program does not tell the VM when you resize its
+window, so the size is set when it connects; a change applies from the next connection. Terrarium
+writes it into the VM's `.rdp` file (`screen mode id`, `desktopwidth`, `desktopheight`), so a hand
+edit of those lines is overwritten. Remote Desktop shares nothing of your laptop with the VM - not even the
 clipboard, which often holds passwords, unless you tick *with clipboard*.
 
 *with sound* (next to Desktop, also in **Settings**) plays the VM's sound on the laptop, e.g. for
@@ -106,6 +115,34 @@ The VM still cannot reach anything on your laptop.
 Prefer that direct address for *looking at* pages: browsers treat every `localhost` port as the
 same site, so a page the VM serves on `localhost:8080` receives the cookies of your other
 `localhost` apps. Forward a port only when a Windows program needs it as `localhost`.
+
+## SSH from other computers
+
+Off by default. In **Settings** - *Advanced* - *SSH from the network*, tick *Other computers on my
+network may log in* and choose the laptop port (22 if nothing else uses it). They log in with the
+VM's Linux password - if it is still the default `ai`, consider changing it: `passwd` in the VM.
+Then, on any computer of the same network:
+
+```
+putty ai@strix            (strix = this laptop's name; or its address, e.g. 192.168.1.23)
+putty -P 2222 ai@strix    (another port)
+ssh ai@strix              (Windows, Linux, macOS)
+```
+
+The first time, PuTTY shows the VM's key and asks whether to trust it: compare it with the key
+Terrarium shows in *Settings* and in the log (`ssh-ed25519 SHA256:...`).
+
+How it works: Windows' port proxy listens on that port on every address of the laptop and passes
+connections to the VM's SSH. A firewall rule (*Terrarium - SSH from the local network to ...*) lets
+in only computers of the laptop's own subnets, and only on networks Windows calls **Private** or
+**Domain** - in a cafe or hotel (*Public*) nobody gets in. If your home network is *Public* in
+Windows, nobody gets in there either: Windows Settings - Network - your network - *Private*.
+
+The VM itself gains nothing: it still cannot open a connection into your network, it only
+answers connections made to it. The risks are in [SECURITY.md](SECURITY.md#ssh-from-the-network):
+anyone on the network can try the password, and the AI is root, so it controls what answers on
+that port. Turn it off when you no longer need it. The **Risks** column shows it as
+*SSH from network*.
 
 ## A VM without a shared folder
 

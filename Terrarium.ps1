@@ -1,5 +1,5 @@
 <#
-Terrarium 1.0.1 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
+Terrarium 1.1.0 - the AI cage: isolated Debian VMs on Hyper-V for AI agents.
 (Formerly "AI Cage": internal names - the .aicage folder, the AICage switch, the Aic commands -
 keep the old name so existing VMs go on working.)
 Start it with Terrarium.cmd (it asks for Administrator rights).   Terrarium.cmd console = commands only.
@@ -34,8 +34,8 @@ function Get-AicLeftovers {
         Where-Object { $_.Name -like 'AICage-*' -and $names -notcontains $_.Name.Substring(7) } |
         ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'Share'; Name = $_.Name; Detail = $_.Path; Sid = $null }) }
 
-    Get-NetFirewallRule -Name 'AICage-SMB-*', 'AICage-NoSMB-*' -ErrorAction SilentlyContinue |
-        Where-Object { $names -notcontains ($_.Name -replace '^AICage-(No)?SMB-', '') } |
+    Get-NetFirewallRule -Name 'AICage-SMB-*', 'AICage-NoSMB-*', 'AICage-LanSsh-*' -ErrorAction SilentlyContinue |
+        Where-Object { $names -notcontains ($_.Name -replace '^AICage-((No)?SMB|LanSsh)-', '') } |
         ForEach-Object { $items.Add([pscustomobject]@{ Kind = 'Firewall'; Name = $_.Name; Detail = $_.DisplayName; Sid = $null }) }
 
     $putty = 'HKCU:\Software\SimonTatham\PuTTY\Sessions'
@@ -321,7 +321,7 @@ function New-AicSeedIso {
 # settings) and the program folder ("Program"). Each VM is in one of them, chosen when it is
 # made; Terrarium looks in both. Root is the Home place ("Root" in config.json overrides it).
 
-$script:AicVersion = '1.0.1'
+$script:AicVersion = '1.1.0'
 
 # Terrarium.ps1 (the single-file build) passes the tool folder as $AicToolRoot; the module form
 # (development) finds it as the parent of the module folder.
@@ -1101,6 +1101,37 @@ namespace AiCage.Native
             finally { Marshal.FreeHGlobal(pcb); }
         }
     }
+
+    public static class Display
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct RECT { public int Left, Top, Right, Bottom; }
+        [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+        [DllImport("gdi32.dll")] static extern int GetDeviceCaps(IntPtr dc, int index);
+        [DllImport("user32.dll")] static extern bool SystemParametersInfo(int action, int param, ref RECT rect, int winIni);
+
+        // The main screen in real pixels (what Remote Desktop's desktopwidth/height mean), whatever
+        // the display scaling and the DPI awareness of this process: width, height, and the work
+        // area (the screen without the taskbar) width and height.
+        public static int[] Primary()
+        {
+            IntPtr dc = GetDC(IntPtr.Zero);
+            try
+            {
+                int physW = GetDeviceCaps(dc, 118), physH = GetDeviceCaps(dc, 117);   // DESKTOPHORZRES, DESKTOPVERTRES
+                int logW = GetDeviceCaps(dc, 8), logH = GetDeviceCaps(dc, 10);        // HORZRES, VERTRES
+                RECT wa = new RECT();
+                if (!SystemParametersInfo(0x30, 0, ref wa, 0)) { wa.Right = logW; wa.Bottom = logH; }   // SPI_GETWORKAREA
+                double sx = logW > 0 ? (double)physW / logW : 1, sy = logH > 0 ? (double)physH / logH : 1;
+                // Display scaling: a DPI-unaware process sees 96 dpi and scaled-down sizes, an
+                // aware one real sizes and the real dpi (LOGPIXELSY); the product is right in both.
+                double scale = sy * GetDeviceCaps(dc, 90) / 96.0;
+                return new int[] { physW, physH, (int)((wa.Right - wa.Left) * sx), (int)((wa.Bottom - wa.Top) * sy), (int)Math.Round(scale * 100) };
+            }
+            finally { ReleaseDC(IntPtr.Zero, dc); }
+        }
+    }
 }
 '@
 
@@ -1493,18 +1524,24 @@ function Remove-AicPortProxy {
 }
 
 function Get-AicPortConflict {
-    # Why some of these laptop ports cannot be forwarded to VM $Name (empty: all fine).
-    param([Parameter(Mandatory)][string]$Name, [string[]]$Ports, [string]$Ip)
+    # Why some of these laptop ports cannot be forwarded to VM $Name (empty: all fine). $LanPort is
+    # the network SSH port (see Set-AicLanSsh below), which listens on every address of the laptop.
+    param([Parameter(Mandatory)][string]$Name, [string[]]$Ports, [string]$Ip, [int]$LanPort = 0)
     $msgs = @()
     $mine = @(Get-AicPortProxy | Where-Object { $Ip -and $_.ConnectAddress -eq $Ip } | ForEach-Object { $_.ListenPort })
     $others = @(Get-AicState | Where-Object { $_.Name -ne $Name })
-    foreach ($f in $Ports) {
-        $h = $f.Split(':')[0]
-        $o = $others | Where-Object { @(Get-AicPortForward $_ | ForEach-Object { $_.Split(':')[0] }) -contains $h } | Select-Object -First 1
+    $checks = @($Ports | ForEach-Object { [pscustomobject]@{ Port = $_.Split(':')[0]; Lan = $false } })
+    if ($LanPort) {
+        if (@($checks | ForEach-Object { $_.Port }) -contains "$LanPort") { $msgs += "laptop port $LanPort cannot be a localhost port and the network SSH port at once" }
+        else { $checks += [pscustomobject]@{ Port = "$LanPort"; Lan = $true } }
+    }
+    foreach ($c in $checks) {
+        $h = $c.Port
+        $o = $others | Where-Object { (@(Get-AicPortForward $_ | ForEach-Object { $_.Split(':')[0] }) + @(Get-AicLanSshPort $_ | Where-Object { $_ } | ForEach-Object { "$_" })) -contains $h } | Select-Object -First 1
         if ($o) { $msgs += "laptop port $h already goes to VM $($o.Name)"; continue }
         if ($mine -contains $h) { continue }
         $busy = Get-NetTCPConnection -State Listen -LocalPort ([int]$h) -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::1', '::' } | Select-Object -First 1
+            Where-Object { $c.Lan -or $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::1', '::' } | Select-Object -First 1
         if ($busy) {
             $prog = (Get-Process -Id $busy.OwningProcess -ErrorAction SilentlyContinue).ProcessName
             $msgs += "laptop port $h is already used by $(if ($prog) { $prog } else { "process $($busy.OwningProcess)" })"
@@ -1514,13 +1551,15 @@ function Get-AicPortConflict {
 }
 
 function Set-AicPortForward {
-    # Makes the port proxy match the VM's Ports list.
+    # Makes the port proxy match the VM's Ports list and its network SSH port, and the firewall
+    # rule of the network SSH port.
     param([Parameter(Mandatory)]$State)
     $want = @(Get-AicPortForward $State)
-    $bad = @(Get-AicPortConflict -Name $State.Name -Ports $want -Ip $State.Ip)
+    $lan = Get-AicLanSshPort $State
+    $bad = @(Get-AicPortConflict -Name $State.Name -Ports $want -Ip $State.Ip -LanPort $lan)
     if ($bad.Count) { throw "Cannot forward: $($bad -join '; ')." }
     foreach ($e in @(Get-AicPortProxy | Where-Object { $_.ConnectAddress -eq $State.Ip })) { Remove-AicPortProxy -Entry $e }
-    if (-not $want.Count) { Write-AicLog 'No port forwards' -Level Debug; return }
+    if (-not $want.Count -and -not $lan) { Write-AicLog 'No port forwards' -Level Debug; Set-AicLanSshRule -State $State; return }
 
     $svc = Get-Service iphlpsvc -ErrorAction SilentlyContinue
     if (-not $svc) { throw 'The IP Helper service (iphlpsvc), which forwards the ports, is missing on this laptop.' }
@@ -1535,6 +1574,18 @@ function Set-AicPortForward {
         }
         Write-AicLog "localhost:$h on this laptop -> $($State.Name) port $v" -Level Info
     }
+    if ($lan) {
+        # Every address of the laptop; the firewall rule decides who may connect.
+        Invoke-AicNative -FilePath 'netsh.exe' -ArgumentList @('interface', 'portproxy', 'add', 'v4tov4',
+            'listenaddress=0.0.0.0', "listenport=$lan", "connectaddress=$($State.Ip)", 'connectport=22') | Out-Null
+        try {
+            # IPv6 too: a computer name can resolve to the laptop's IPv6 address first.
+            Invoke-AicNative -FilePath 'netsh.exe' -ArgumentList @('interface', 'portproxy', 'add', 'v6tov4',
+                'listenaddress=::', "listenport=$lan", "connectaddress=$($State.Ip)", 'connectport=22') | Out-Null
+        } catch { Write-AicLog "Network SSH over IPv6 not set up ($($_.Exception.Message)) - IPv4 works" -Level Warn }
+        Write-AicLog "port $lan of this laptop, from the local network -> $($State.Name) SSH (port 22)" -Level Info
+    }
+    Set-AicLanSshRule -State $State
     Start-Sleep -Seconds 1
     foreach ($f in $want) {
         $h = $f.Split(':')[0]
@@ -1542,6 +1593,129 @@ function Set-AicPortForward {
             Write-AicLog "Windows does not listen on localhost:$h yet. If it stays so: Restart-Service iphlpsvc" -Level Warn
         }
     }
+    if ($lan -and -not (Get-NetTCPConnection -State Listen -LocalPort $lan -LocalAddress 0.0.0.0 -ErrorAction SilentlyContinue)) {
+        Write-AicLog "Windows does not listen on port $lan yet. If it stays so: Restart-Service iphlpsvc" -Level Warn
+    }
+}
+
+# ---- Network SSH ------------------------------------------------------------------------
+# Optional, per VM, off by default: other computers on the local network log in to the VM with
+# PuTTY or ssh as <user>@<laptop name>, port LanSshPort, with the Linux password. Windows' port
+# proxy listens on every address of the laptop and passes the connection to the VM's port 22.
+# A firewall rule lets in only computers of the laptop's own subnets, and only while Windows
+# calls the network Private or Domain - not in a cafe or hotel (Public). The VM still cannot open
+# connections into the network: Strict's filter and the block rules are unchanged; it only answers
+# on connections made to it. The default password 'ai' is easy to guess: passwd in the VM changes it.
+
+function Get-AicLanSshPort($State) {
+    if ($State.PSObject.Properties['LanSshPort'] -and $State.LanSshPort) { return [int]$State.LanSshPort }
+    return 0
+}
+
+function Get-AicLanSshRuleName($State) { return "AICage-LanSsh-$($State.Name)" }
+
+function Set-AicLanSshRule {
+    # Made again whenever it differs from exactly the scope below (or should not be there).
+    param([Parameter(Mandatory)]$State)
+    $name = Get-AicLanSshRuleName $State
+    $old = Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue
+    $port = Get-AicLanSshPort $State
+    if ($old -and $port) {
+        $pf = $old | Get-NetFirewallPortFilter; $af = $old | Get-NetFirewallAddressFilter
+        if ("$($old.Action)" -eq 'Allow' -and "$($old.Direction)" -eq 'Inbound' -and "$($old.Enabled)" -eq 'True' -and "$($old.Profile)" -eq 'Domain, Private' -and
+            "$($pf.Protocol)" -eq 'TCP' -and "$($pf.LocalPort)" -eq "$port" -and "$($af.RemoteAddress)" -eq 'LocalSubnet') { return }
+    }
+    if ($old) { Write-AicLog "Remove-NetFirewallRule $name" -Level Cmd; $old | Remove-NetFirewallRule }
+    if (-not $port) { return }
+    Write-AicLog "New-NetFirewallRule ${name}: allow inbound TCP $port from LocalSubnet, Private and Domain networks only" -Level Cmd
+    New-NetFirewallRule -Name $name -DisplayName "Terrarium - SSH from the local network to $($State.Name) (port $port)" -Group 'Terrarium' `
+        -Direction Inbound -Action Allow -Protocol TCP -LocalPort $port -RemoteAddress LocalSubnet -Profile Private, Domain | Out-Null
+}
+
+function Get-AicLanAddress {
+    # How other computers find this laptop: its name and its IPv4 addresses on networks that Windows
+    # calls Private or Domain (only there the firewall rule lets them in).
+    $profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -notlike 'vEthernet*' })
+    $trusted = @($profiles | Where-Object { "$($_.NetworkCategory)" -in 'Private', 'DomainAuthenticated' })
+    $ips = @($trusted | ForEach-Object { Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue } |
+        Where-Object { $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.IPAddress } | Select-Object -Unique)
+    return [pscustomobject]@{
+        Name      = $env:COMPUTERNAME.ToLower()
+        Addresses = $ips
+        Public    = @($profiles | Where-Object { "$($_.NetworkCategory)" -eq 'Public' } | ForEach-Object { "$($_.Name) ($($_.InterfaceAlias))" })
+    }
+}
+
+function Get-AicHostKeySha256 {
+    # The VM's host keys as PuTTY and OpenSSH show them on the first connect: "ssh-ed25519 SHA256:...".
+    param([Parameter(Mandatory)]$State)
+    $known = Get-AicKnownHostsPath $State
+    if (-not (Test-Path -LiteralPath $known)) { return @() }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    return @(Get-Content -LiteralPath $known | Where-Object { $_.StartsWith("$($State.Ip) ") } | ForEach-Object {
+        $f = $_ -split '\s+'
+        "$($f[1]) SHA256:$(([Convert]::ToBase64String($sha.ComputeHash([Convert]::FromBase64String($f[2])))).TrimEnd('='))"
+    })
+}
+
+function Get-AicLanSshInfo {
+    # What to type on another computer, and what PuTTY must show there the first time.
+    param([string]$Name, $State)
+    if (-not $State) { $State = Get-AicState1 -Name $Name }
+    $port = Get-AicLanSshPort $State
+    $lan = Get-AicLanAddress
+    $p = if ($port -eq 22) { '' } else { "-P $port " }
+    $keys = @(Get-AicHostKeySha256 -State $State)
+    if (-not $keys.Count -and (Test-AicTcpPort -Ip $State.Ip -Port 22 -TimeoutMs 1500)) { $null = Test-AicSshReady -State $State; $keys = @(Get-AicHostKeySha256 -State $State) }
+    return [pscustomobject]@{
+        Port      = $port
+        Command   = "putty $p$($State.User)@$($lan.Name)"
+        Addresses = $lan.Addresses
+        Public    = $lan.Public
+        HostKeys  = $keys
+    }
+}
+
+function Get-AicLanSshDefaultPort {
+    # 22, so that "putty ai@laptop" just works - unless something else has it; then 2222 and up.
+    param([Parameter(Mandatory)][string]$Name)
+    $s = Get-AicState -Name $Name
+    $ip = if ($s) { $s.Ip } else { $null }
+    $ports = if ($s) { @(Get-AicPortForward $s) } else { @() }
+    foreach ($p in @(22) + (2222..2240)) {
+        if (-not @(Get-AicPortConflict -Name $Name -Ports $ports -Ip $ip -LanPort $p).Count) { return $p }
+    }
+    return 2222
+}
+
+function Write-AicLanSshInfo {
+    param([Parameter(Mandatory)]$State)
+    $i = Get-AicLanSshInfo -State $State
+    Write-AicLog "From another computer on your network: $($i.Command)$(if ($i.Addresses.Count) { "  (or the address $($i.Addresses -join ', '))" }), with the Linux password" -Level Ok
+    Write-AicLog "Anyone on that network can try the password; if it is still 'ai', change it in the VM: passwd" -Level Info
+    foreach ($k in $i.HostKeys) { Write-AicLog "The first time, PuTTY shows the VM's key - it must be: $k" -Level Info }
+    if (-not $i.Addresses.Count) {
+        Write-AicLog "No network of this laptop is Private or Domain in Windows, so the firewall lets nobody in. Windows Settings - Network - your network - Private, if it is your own." -Level Warn
+    } elseif ($i.Public.Count) {
+        Write-AicLog "Not reachable on Public networks: $($i.Public -join ', ')" -Level Info
+    }
+}
+
+function Set-AicLinuxPassword {
+    # Sets the Linux user's password (sudo, PuTTY, Desktop). It travels base64-encoded over SSH and
+    # is not logged.
+    param([Parameter(Mandatory)]$State, [Parameter(Mandatory)][string]$Plain)
+    if ($Plain -match "[`r`n]") { throw 'The password must not contain a line break.' }
+    $b64 = ConvertTo-AicB64 "$($State.User):$Plain`n"
+    $out = Invoke-AicSsh -State $State -Quiet -OkExitCodes 0, 3 -Script @"
+# Terrarium: new password for $($State.User)
+sudo -n true 2>/dev/null || { echo NOSUDO; exit 3; }
+echo $b64 | base64 -d | sudo chpasswd && echo PASSWORD-SET
+"@
+    $text = $out -join ' '
+    if ($text -match 'NOSUDO') { throw "sudo in $($State.Name) asks for a password, so Terrarium cannot change it. In the VM: passwd" }
+    if ($text -notmatch 'PASSWORD-SET') { throw "The password was not changed: $text" }
+    Write-AicLog "Password of $($State.User) changed" -Level Ok
 }
 
 # ---- Private/Share.ps1 ----------------------------------------------------------------
@@ -2050,12 +2224,60 @@ function Test-AicClipboard($State) {
     return [bool]($State.PSObject.Properties['Clipboard'] -and $State.Clipboard)
 }
 
+# Desktop size: 'Fit' (a window as large as the screen allows, the default), 'Full' (full screen)
+# or a fixed 'WIDTHxHEIGHT'. Windows' Remote Desktop program does not tell xrdp when its window is
+# resized, so without a size in the .rdp file the desktop opens at 800x600; Terrarium writes it.
+
+function ConvertTo-AicDesktopSize {
+    # Checks and normalizes a desktop size: Fit, Full or e.g. '1920x1080' (also '1920 x 1080').
+    param([string]$Size)
+    $t = "$Size".Trim()
+    if (-not $t -or $t -match '^fit') { return 'Fit' }
+    if ($t -match '^full') { return 'Full' }
+    if ($t -notmatch '^(\d{3,5})\s*[x*,]\s*(\d{3,5})$') { throw "Desktop size '$Size': use Fit, Full or a size like 1920x1080." }
+    $w = [int]$Matches[1]; $h = [int]$Matches[2]
+    if ($w -lt 640 -or $h -lt 480 -or $w -gt 8192 -or $h -gt 8192) { throw "Desktop size '$Size': from 640x480 to 8192x8192." }
+    return "${w}x$h"
+}
+
+function Get-AicDesktopSize($State) {
+    if ($State.PSObject.Properties['DesktopSize'] -and $State.DesktopSize) { return "$($State.DesktopSize)" }
+    return 'Fit'
+}
+
+function Get-AicScreenSize {
+    # The main screen in real pixels: Width, Height, the work area (without the taskbar) and the
+    # display scaling in percent. $null when Windows does not say (e.g. no interactive desktop).
+    try {
+        Initialize-AicNative
+        $p = [AiCage.Native.Display]::Primary()
+        if ($p[0] -lt 640 -or $p[1] -lt 480) { return $null }
+        return [pscustomobject]@{ Width = $p[0]; Height = $p[1]; WorkWidth = $p[2]; WorkHeight = $p[3]; Scale = $p[4] }
+    } catch { return $null }
+}
+
+function Get-AicDesktopPixels {
+    # What a desktop size means on this laptop now: screen mode (1 window, 2 full screen) and the
+    # desktop's width and height. Fit leaves room for the window's frame and title bar.
+    param([string]$Size)
+    $size = ConvertTo-AicDesktopSize $Size
+    if ($size -match '^(\d+)x(\d+)$') { return [pscustomobject]@{ Mode = 1; Width = [int]$Matches[1]; Height = [int]$Matches[2] } }
+    $scr = Get-AicScreenSize
+    if (-not $scr) { return [pscustomobject]@{ Mode = $(if ($size -eq 'Full') { 2 } else { 1 }); Width = 1600; Height = 900 } }
+    if ($size -eq 'Full') { return [pscustomobject]@{ Mode = 2; Width = $scr.Width; Height = $scr.Height } }
+    $f = $scr.Scale / 100
+    # Even sizes, a multiple of 4: what every Remote Desktop server takes without complaint.
+    $w = [int]([math]::Floor(($scr.WorkWidth - 24 * $f) / 4) * 4)
+    $h = [int]([math]::Floor(($scr.WorkHeight - 56 * $f) / 4) * 4)
+    return [pscustomobject]@{ Mode = 1; Width = [math]::Max(640, $w); Height = [math]::Max(480, $h) }
+}
+
 function Start-AicDesktop {
     param([Parameter(Mandatory)]$State)
     $rdp = Join-Path (Split-Path (Get-AicStatePath -Name $State.Name -Location (Get-AicStateLocation $State))) "$($State.Name).rdp"
     if (-not (Test-Path -LiteralPath $rdp)) {
         $lines = @(
-            "full address:s:$($State.Ip)", "username:s:$($State.User)", 'screen mode id:i:1', 'dynamic resolution:i:1'   # no smart sizing: it scales the picture instead of resizing the desktop
+            "full address:s:$($State.Ip)", "username:s:$($State.User)", 'dynamic resolution:i:1'   # no smart sizing: it scales the picture instead of resizing the desktop
             'authentication level:i:0', 'enablecredsspsupport:i:0', 'prompt for credentials:i:0'
             'redirectclipboard:i:0', 'redirectprinters:i:0', 'redirectdrives:i:0', 'drivestoredirect:s:', 'redirectcomports:i:0'
             'redirectsmartcards:i:0', 'devicestoredirect:s:', 'camerastoredirect:s:', 'audiomode:i:2', 'audiocapturemode:i:0'
@@ -2063,11 +2285,17 @@ function Start-AicDesktop {
         Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
     }
     # audiomode 0 plays the VM's sound here, 2 drops it; redirectclipboard 1 shares the clipboard
-    # both ways. Only these lines follow the VM's settings, so other edits to the file stay.
+    # both ways; screen mode id 1 is a window, 2 full screen. Only these lines follow the VM's
+    # settings, so other edits to the file stay.
     $audio = if (Test-AicSound $State) { 'audiomode:i:0' } else { 'audiomode:i:2' }
     $clip = if (Test-AicClipboard $State) { 'redirectclipboard:i:1' } else { 'redirectclipboard:i:0' }
-    $lines = @(Get-Content -LiteralPath $rdp -Encoding Unicode | Where-Object { $_ -notmatch '^(audiomode|redirectclipboard):' }) + $audio + $clip
+    $size = Get-AicDesktopSize $State
+    $px = Get-AicDesktopPixels $size
+    $managed = '^(audiomode|redirectclipboard|screen mode id|desktopwidth|desktopheight):'
+    $lines = @(Get-Content -LiteralPath $rdp -Encoding Unicode | Where-Object { $_ -notmatch $managed }) + $audio + $clip +
+        "screen mode id:i:$($px.Mode)" + "desktopwidth:i:$($px.Width)" + "desktopheight:i:$($px.Height)"
     Set-Content -LiteralPath $rdp -Value $lines -Encoding Unicode
+    Write-AicLog "Desktop of $($State.Name): $($px.Width) x $($px.Height)$(if ($px.Mode -eq 2) { ', full screen' } else { ' in a window' }) ($size)" -Level Info
     Write-AicLog "mstsc.exe $rdp  (log in as $($State.User) with your Linux password)" -Level Debug
     Start-Process -FilePath 'mstsc.exe' -ArgumentList "`"$rdp`""
 }
@@ -2230,6 +2458,8 @@ function Show-AiCage {
   Set-AicVm agent1 -SharedFolder D:\Work\agent1   change the shared folder (-NoSharedFolder: none)
   Set-AicVm agent1 -Clipboard $true   copy and paste with the desktop (both ways)
   Set-AicVm agent1 -Ports 8080,3000:80   localhost:8080 on this laptop -> port 8080 in the VM
+  Set-AicVm agent1 -DesktopSize 1920x1080   desktop size (Fit: window that fits the screen, Full)
+  Set-AicVm agent1 -LanSshPort 22   PuTTY from other PCs: putty ai@<this laptop>
   Install-AicTool agent1 -Tool Desktop   add Docker, ClaudeCode, Codex or Desktop later
   Start-AicVm / Stop-AicVm / Restart-AicVm agent1   (Restart-AicVm -Force: hard reset)
   Move-AicVm agent1 -To Home       move the VM to your user folder (-To Program: back)
@@ -2296,6 +2526,7 @@ function Invoke-AicVmCheck {
         if ($other) { Write-AicLog "Isolation OK, but $other other test(s) failed (see above)" -Level Warn }
         else { Write-AicLog "All tests passed ($($State.Isolation) isolation)" -Level Ok }
     }
+    if (Get-AicLanSshPort $State) { Write-AicLog "Note: $($State.Name) accepts SSH logins from the local network on port $(Get-AicLanSshPort $State) (Settings - Advanced)" -Level Warn }
     return $results
 }
 
@@ -2308,6 +2539,7 @@ function Repair-AicVm {
     [void](Disable-AicHostInfo -State $State)
     if ((Test-AicHasShare $State) -and -not (Get-NetFirewallRule -Name "AICage-SMB-$($State.Name)" -ErrorAction SilentlyContinue)) { New-AicShareFirewallRule -State $State }
     Set-AicNoShareRule -State $State
+    Set-AicLanSshRule -State $State
 }
 
 function Test-AicQuarantined($State) { return [bool]($State.PSObject.Properties['Quarantined'] -and $State.Quarantined) }
@@ -2909,6 +3141,8 @@ function Get-AicVm {
                 Ports        = @(Get-AicPortForward $s)
                 Sound        = Test-AicSound $s
                 Clipboard    = Test-AicClipboard $s
+                DesktopSize  = Get-AicDesktopSize $s
+                LanSshPort   = Get-AicLanSshPort $s
             }
         }
     }
@@ -2929,6 +3163,17 @@ function Set-AicVm {
     .PARAMETER NoSharedFolder
     Takes the shared folder away: the VM then sees no folder of this laptop. -SharedFolder adds
     one again (the VM must be running).
+    .PARAMETER DesktopSize
+    Size of the Remote Desktop: Fit (a window as large as the screen allows), Full (full screen)
+    or e.g. 1920x1080. From the next connection on.
+    .PARAMETER LanSshPort
+    Lets other computers on the local network log in with PuTTY or ssh: <user>@<this laptop>,
+    on this laptop port (22 if nothing else uses it), with the Linux password. 0 turns it off.
+    It works only on networks Windows calls Private or Domain.
+    .PARAMETER Password
+    New password of the Linux user (sudo, PuTTY, Desktop). The VM must be running.
+    .EXAMPLE
+    Set-AicVm agent1 -LanSshPort 22
     .NOTES
     Processor count and startup memory need the VM off; the rest works while it runs.
     #>
@@ -2946,7 +3191,10 @@ function Set-AicVm {
         [switch]$NoSharedFolder,
         [AllowEmptyCollection()][string[]]$Ports,
         [bool]$Sound,
-        [bool]$Clipboard
+        [bool]$Clipboard,
+        [string]$DesktopSize,
+        [ValidateRange(0, 65535)][int]$LanSshPort,
+        [Security.SecureString]$Password
     )
     process {
         Assert-AicReady
@@ -2955,6 +3203,8 @@ function Set-AicVm {
         Start-AicLog "set-$Name"
         $vm = Get-VM -Name $Name
         $running = $vm.State -ne 'Off'
+        # Checked first, so that nothing is half changed.
+        if ($PSBoundParameters.ContainsKey('DesktopSize')) { $null = ConvertTo-AicDesktopSize $DesktopSize }
 
         $memArgs = @{}
         if ($PSBoundParameters.ContainsKey('MemoryMinMB')) { $memArgs.MinimumBytes = [int64]$MemoryMinMB * 1MB }
@@ -2998,11 +3248,35 @@ function Set-AicVm {
                 Invoke-AicStep "Shared folder: $folder$(if ($ro) { ' (read-only)' })" { Set-AicShareFolder -State $s -Folder $folder -ReadOnly $ro -Running ($vm.State -eq 'Running') }
             }
         }
-        if ($PSBoundParameters.ContainsKey('Ports')) {
-            $list = @(ConvertTo-AicPortList $Ports)
-            $s | Add-Member -NotePropertyName Ports -NotePropertyValue $list -Force
-            Invoke-AicStep "Port forwards: $(if ($list.Count) { $list -join ', ' } else { 'none' })" { Set-AicPortForward -State $s }
+        $oldLan = Get-AicLanSshPort $s
+        $newLan = if ($PSBoundParameters.ContainsKey('LanSshPort')) { $LanSshPort } else { $oldLan }
+        if ($PSBoundParameters.ContainsKey('Password')) {
+            $plain = ConvertFrom-AicSecureString $Password
+            if (-not $plain) { throw 'The Linux password must not be empty.' }
+            if ($vm.State -ne 'Running') { throw 'Start the VM to change its password.' }
+            Invoke-AicStep "Password of $($s.User)" { Set-AicLinuxPassword -State $s -Plain $plain }
+        }
+        if ($PSBoundParameters.ContainsKey('Ports') -or $newLan -ne $oldLan) {
+            $what = @()
+            if ($PSBoundParameters.ContainsKey('Ports')) {
+                $list = @(ConvertTo-AicPortList $Ports)
+                $s | Add-Member -NotePropertyName Ports -NotePropertyValue $list -Force
+                $what += "port forwards: $(if ($list.Count) { $list -join ', ' } else { 'none' })"
+            }
+            if ($newLan -ne $oldLan) {
+                $s | Add-Member -NotePropertyName LanSshPort -NotePropertyValue $newLan -Force
+                $what += "SSH from the network: $(if ($newLan) { "port $newLan" } else { 'off' })"
+            }
+            Invoke-AicStep ($what -join ', ') { Set-AicPortForward -State $s }
             Save-AicState $s
+            if ($newLan) { Write-AicLanSshInfo -State $s }
+        }
+        if ($PSBoundParameters.ContainsKey('DesktopSize')) {
+            $size = ConvertTo-AicDesktopSize $DesktopSize
+            $s | Add-Member -NotePropertyName DesktopSize -NotePropertyValue $size -Force
+            Save-AicState $s
+            $px = Get-AicDesktopPixels $size
+            Write-AicLog "Desktop size: $size - $($px.Width) x $($px.Height)$(if ($px.Mode -eq 2) { ', full screen' }) on this screen (from the next Remote Desktop connection)" -Level Ok
         }
         if ($PSBoundParameters.ContainsKey('Sound')) {
             $s | Add-Member -NotePropertyName Sound -NotePropertyValue $Sound -Force
@@ -3270,6 +3544,10 @@ function Remove-AicVm {
         if ($s.Ip) {
             & $try 'Port forwards' { foreach ($e in @(Get-AicPortProxy | Where-Object { $_.ConnectAddress -eq $s.Ip })) { Remove-AicPortProxy -Entry $e } }
         }
+        & $try 'Network SSH firewall rule' {
+            $r = Get-NetFirewallRule -Name (Get-AicLanSshRuleName $s) -ErrorAction SilentlyContinue
+            if ($r) { Write-AicLog "Remove-NetFirewallRule $($r.Name)" -Level Cmd; $r | Remove-NetFirewallRule }
+        }
         & $try 'SSH key and saved sessions' {
             if ($s.Ip) { Remove-AicKnownHost -State $s }
             $key = Get-AicKeyPath $s
@@ -3387,7 +3665,7 @@ function Uninstall-AiCage {
     Write-AicLog "Terrarium removed. Logs stay in $(Get-AicPath Logs)." -Level Ok
 }
 
-Export-ModuleMember -Function @('Test-AicHost', 'Enable-AicHyperV', 'New-AicVm', 'Remove-AicVm', 'Get-AicVm', 'Set-AicVm', 'Start-AicVm', 'Stop-AicVm', 'Connect-AicVm', 'Move-AicVm', 'Get-AicSetting', 'Set-AicSetting', 'Get-AicPuttyExe', 'Test-AicVm', 'Get-AicConfig', 'Get-AicLogPath', 'Remove-AicHostNetwork', 'Uninstall-AiCage', 'Protect-AicNetwork', 'Remove-AicLeftovers', 'Install-AicTool', 'Restart-AicVm', 'Debug-AicVm', 'ConvertTo-AicPortList', 'Register-AicLogSink', 'Unregister-AicLogSink', 'Show-AiCage')
+Export-ModuleMember -Function @('Test-AicHost', 'Enable-AicHyperV', 'New-AicVm', 'Remove-AicVm', 'Get-AicVm', 'Set-AicVm', 'Start-AicVm', 'Stop-AicVm', 'Connect-AicVm', 'Move-AicVm', 'Get-AicSetting', 'Set-AicSetting', 'Get-AicPuttyExe', 'Test-AicVm', 'Get-AicConfig', 'Get-AicLogPath', 'Remove-AicHostNetwork', 'Uninstall-AiCage', 'Protect-AicNetwork', 'Remove-AicLeftovers', 'Install-AicTool', 'Restart-AicVm', 'Debug-AicVm', 'ConvertTo-AicPortList', 'Get-AicShareWarnings', 'ConvertTo-AicDesktopSize', 'Get-AicDesktopPixels', 'Get-AicLanSshInfo', 'Get-AicLanSshDefaultPort', 'Register-AicLogSink', 'Unregister-AicLogSink', 'Show-AiCage')
 }
 $AicModuleText = $AicModuleBlock.ToString()
 $AicLoader = 'New-Module -Name AiCage -ArgumentList $AicToolRoot -ScriptBlock ([scriptblock]::Create($AicModuleText)) | Import-Module -Force'
@@ -3509,7 +3787,24 @@ $mainXaml = @'
             </ContextMenu>
           </Button.ContextMenu>
         </Button>
-        <Button x:Name="BtnDesktop" Content="Desktop" ToolTip="Open the VM's graphical desktop in Remote Desktop (install it under Settings - Advanced)"/>
+        <Button x:Name="BtnDesktop" Content="Desktop" Margin="0" ToolTip="Open the VM's graphical desktop in Remote Desktop (install it under Settings - Advanced)"/>
+        <Button x:Name="DesktopChoice" MinWidth="0" Padding="5,5" Margin="1,0,6,0"
+                ToolTip="Size of the desktop: a window that fits this screen, full screen or a fixed size (for each VM)">
+          <Path Data="M0,0 L8,0 L4,5 Z" Fill="#374151" VerticalAlignment="Center"/>
+          <Button.ContextMenu>
+            <ContextMenu>
+              <MenuItem Header="Fit this screen (window)" Tag="Fit" IsCheckable="True"/>
+              <MenuItem Header="Full screen" Tag="Full" IsCheckable="True"/>
+              <Separator/>
+              <MenuItem Header="1280 x 720" Tag="1280x720" IsCheckable="True"/>
+              <MenuItem Header="1600 x 900" Tag="1600x900" IsCheckable="True"/>
+              <MenuItem Header="1920 x 1080" Tag="1920x1080" IsCheckable="True"/>
+              <MenuItem Header="2560 x 1440" Tag="2560x1440" IsCheckable="True"/>
+              <Separator/>
+              <MenuItem Header="Other size..." Tag="Other" IsCheckable="True"/>
+            </ContextMenu>
+          </Button.ContextMenu>
+        </Button>
         <Button x:Name="BtnFolder" Content="Shared folder" ToolTip="Open the VM's shared folder in Explorer"/>
         <Button x:Name="BtnScreen" Content="Screen" ToolTip="Show the VM's screen (Hyper-V console)"/>
         <Button x:Name="BtnTest" Content="Test and secure" ToolTip="Check what the VM can reach; repair or quarantine it if something is open"/>
@@ -3583,7 +3878,7 @@ $mainXaml = @'
 $newXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="New VM" Width="600" SizeToContent="Height" ResizeMode="NoResize"
+        Title="New VM" Width="660" MinWidth="520" SizeToContent="Height" ResizeMode="CanResizeWithGrip"
         WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="13" Background="White">
   <Window.Resources>
     <Style TargetType="TextBlock" x:Key="Label">
@@ -3605,172 +3900,179 @@ $newXaml = @'
     </Style>
     <BooleanToVisibilityConverter x:Key="B2V"/>
   </Window.Resources>
-  <StackPanel Margin="20,16,20,16">
-    <Grid>
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="160"/>
-        <ColumnDefinition Width="*"/>
-      </Grid.ColumnDefinitions>
-      <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/>
-      </Grid.RowDefinitions>
-
-      <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Name"/>
-      <StackPanel Grid.Row="0" Grid.Column="1">
-        <TextBox x:Name="NameBox"/>
-        <TextBlock Style="{StaticResource Hint}" Text="Lowercase letters, digits and dashes, up to 16 characters."/>
+  <!-- Buttons stay visible; the rest scrolls when the window would be taller than the screen. -->
+  <DockPanel>
+    <StackPanel DockPanel.Dock="Bottom" Margin="20,0,20,16">
+      <TextBlock x:Name="ErrorText" Foreground="#C62828" TextWrapping="Wrap" Margin="0,10,0,0" Visibility="Collapsed"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+        <Button x:Name="BtnOk" Content="Create VM" IsDefault="True" Margin="0,0,8,0" Background="#1F6FEB" Foreground="White" FontWeight="SemiBold"/>
+        <Button x:Name="BtnCancel" Content="Cancel" IsCancel="True"/>
       </StackPanel>
-
-      <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Shared folder"/>
-      <StackPanel Grid.Row="2" Grid.Column="1">
-        <CheckBox x:Name="ShareBox" Content="Share a folder of this laptop with the VM" IsChecked="True" Margin="0,0,0,6"/>
-        <StackPanel IsEnabled="{Binding IsChecked, ElementName=ShareBox}">
-          <DockPanel>
-            <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
-            <TextBox x:Name="FolderBox"/>
-          </DockPanel>
-          <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
-          <TextBlock Style="{StaticResource Hint}" Text="The only folder of this laptop the VM can see (as ~/shared). Put nothing there the AI must not read."/>
-          <TextBlock x:Name="FolderWarn" Style="{StaticResource Risk}" Foreground="#C62828" Visibility="Collapsed"/>
-          <TextBlock Style="{StaticResource Risk}" Text="Risk: what the AI writes here can run on Windows when you open or use it - scripts, shortcuts, git hooks, VS Code tasks. Treat it like a download from the internet. Read-only is safer."/>
-        </StackPanel>
-        <TextBlock x:Name="NoShareHint" Style="{StaticResource Hint}" Visibility="Collapsed"
-                   Text="No shared folder: the VM sees no file of this laptop and cannot reach its file sharing at all. Settings can add one later."/>
-      </StackPanel>
-
-      <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Linux user"/>
-      <TextBox Grid.Row="4" Grid.Column="1" x:Name="UserBox"/>
-
-      <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Password"/>
-      <StackPanel Grid.Row="6" Grid.Column="1">
-        <TextBox x:Name="PassBox"/>
-        <TextBlock Style="{StaticResource Hint}" Text="For sudo, PuTTY and the Desktop. The Terminal button logs in with a key, no password needed. Every program on this laptop can try it over SSH - if others use this laptop, choose more than 'ai'."/>
-      </StackPanel>
-
-      <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Memory (MB)"/>
-      <StackPanel Grid.Row="8" Grid.Column="1">
-        <StackPanel Orientation="Horizontal">
-          <TextBlock Text="at least" VerticalAlignment="Center" Margin="0,0,6,0"/>
-          <ComboBox x:Name="MinMemBox" Width="90" IsEditable="True"/>
-          <TextBlock Text="at most" VerticalAlignment="Center" Margin="14,0,6,0"/>
-          <ComboBox x:Name="MaxMemBox" Width="90" IsEditable="True"/>
-        </StackPanel>
-        <TextBlock Style="{StaticResource Hint}" Text="The VM takes what it needs between the two. Below 1024 MB, Hyper-V may squeeze a busy VM until it freezes."/>
-      </StackPanel>
-
-      <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Processors / disk"/>
-      <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
-        <ComboBox x:Name="CpuBox" Width="60"/>
-        <TextBlock Text="CPUs" VerticalAlignment="Center" Margin="6,0,18,0"/>
-        <ComboBox x:Name="DiskBox" Width="70" IsEditable="True"/>
-        <TextBlock Text="GB disk (grows as needed)" VerticalAlignment="Center" Margin="6,0,0,0"/>
-      </StackPanel>
-
-      <TextBlock Grid.Row="12" Style="{StaticResource Label}" Text="Startup"/>
-      <CheckBox Grid.Row="12" Grid.Column="1" x:Name="AutoBox" Content="Start automatically with Windows" VerticalAlignment="Center"/>
-
-      <TextBlock Grid.Row="14" Style="{StaticResource Label}" Text="Network" VerticalAlignment="Top"/>
-      <StackPanel Grid.Row="14" Grid.Column="1">
-        <RadioButton x:Name="StrictBox" GroupName="Iso" Content="Strict (recommended): internet only - no home, office or cowork network"/>
-        <RadioButton x:Name="OpenBox" GroupName="Iso" Content="Open: the VM may also reach the local network" Margin="0,4,0,0"/>
-        <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=OpenBox, Converter={StaticResource B2V}}"
-                   Text="Risk: the AI can then reach your router, printers, NAS, smart devices and other computers - and the office network when you are there."/>
-      </StackPanel>
-
-      <TextBlock Grid.Row="16" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
-      <StackPanel Grid.Row="16" Grid.Column="1">
-        <TextBox x:Name="PortsBox"/>
-        <TextBlock Style="{StaticResource Hint}" Text="Optional, e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop then reach the VM's services (e.g. Docker containers) as localhost:8080; the local network does not. TCP only."/>
-        <TextBlock Style="{StaticResource Risk}" Text="Risk: browsers treat all of localhost as one site - a page from the VM on localhost gets the cookies of your other local apps. To just look at a page, open http://&lt;VM address&gt;:&lt;port&gt; instead."/>
-      </StackPanel>
-    </Grid>
-
-    <Expander Header="Advanced" Margin="0,14,0,0">
-      <Grid Margin="0,8,0,0">
-        <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="160"/>
-          <ColumnDefinition Width="*"/>
-        </Grid.ColumnDefinitions>
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
-          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
-          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
-          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
-          <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
-          <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
-        <StackPanel Grid.Row="0" Grid.Column="1">
-          <WrapPanel>
-            <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,0"/>
-            <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,0"/>
-            <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,0"/>
-            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,0"/>
-            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,10,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
-            <CheckBox x:Name="ClipBox" Content="with clipboard" Margin="0,0,18,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
-          </WrapPanel>
-          <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more). Desktop: a light graphical desktop with Firefox, opened with the Desktop button (Remote Desktop); about 1 GB. With sound, the VM's sound plays on this laptop (the microphone is never shared)."/>
-          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ToolDesktop, Converter={StaticResource B2V}}"
-                     Text="Desktop: Remote Desktop shares no drives or printers, and the clipboard only if you tick it. The VM can draw anything in that window - never type your Windows password there."/>
-          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=SoundBox, Converter={StaticResource B2V}}"
-                     Text="Risk (low): sound is one more data stream from the VM into Windows' Remote Desktop program. Leave it off unless you need it."/>
-          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ClipBox, Converter={StaticResource B2V}}"
-                     Text="Risk: the clipboard works both ways - the VM can read what you copy on Windows (often passwords) and put text into your clipboard."/>
-        </StackPanel>
-        <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
-        <StackPanel Grid.Row="2" Grid.Column="1">
-          <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
-          <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
-          <TextBlock Style="{StaticResource Hint}" Text="Where the VM's disk (a few GB), key and settings live. Terrarium finds VMs in both places."/>
-        </StackPanel>
-        <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Extra packages"/>
-        <StackPanel Grid.Row="4" Grid.Column="1">
-          <TextBox x:Name="PkgBox"/>
-          <TextBlock Style="{StaticResource Hint}" Text="Debian packages, separated by spaces, e.g. nodejs npm python3-pip"/>
-        </StackPanel>
-        <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Setup script"/>
-        <StackPanel Grid.Row="6" Grid.Column="1">
-          <DockPanel>
-            <Button x:Name="BtnScript" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
-            <TextBox x:Name="ScriptBox"/>
-          </DockPanel>
-          <TextBlock Style="{StaticResource Hint}" Text="Optional bash script, run once as root at the end of the first boot."/>
-        </StackPanel>
-        <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Time zone"/>
-        <StackPanel Grid.Row="8" Grid.Column="1">
-          <TextBox x:Name="TzBox"/>
-          <TextBlock Style="{StaticResource Hint}" Text="Empty: same as Windows. Otherwise e.g. Europe/Warsaw"/>
-        </StackPanel>
-        <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Keyboard"/>
-        <StackPanel Grid.Row="10" Grid.Column="1">
-          <TextBox x:Name="KbBox"/>
-          <TextBlock Style="{StaticResource Hint}" Text="Empty: same as Windows. Only matters on the VM's screen, not in the terminal."/>
-        </StackPanel>
-      </Grid>
-    </Expander>
-
-    <TextBlock x:Name="ErrorText" Foreground="#C62828" TextWrapping="Wrap" Margin="0,12,0,0" Visibility="Collapsed"/>
-    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
-      <Button x:Name="BtnOk" Content="Create VM" IsDefault="True" Margin="0,0,8,0" Background="#1F6FEB" Foreground="White" FontWeight="SemiBold"/>
-      <Button x:Name="BtnCancel" Content="Cancel" IsCancel="True"/>
     </StackPanel>
-  </StackPanel>
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Margin="20,16,20,4">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="160"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+
+          <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Name"/>
+          <StackPanel Grid.Row="0" Grid.Column="1">
+            <TextBox x:Name="NameBox"/>
+            <TextBlock Style="{StaticResource Hint}" Text="Lowercase letters, digits and dashes, up to 16 characters."/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Shared folder"/>
+          <StackPanel Grid.Row="2" Grid.Column="1">
+            <CheckBox x:Name="ShareBox" IsChecked="True" Margin="0,0,0,6"><TextBlock Text="Share a folder of this laptop with the VM" TextWrapping="Wrap"/></CheckBox>
+            <StackPanel IsEnabled="{Binding IsChecked, ElementName=ShareBox}">
+              <DockPanel>
+                <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
+                <TextBox x:Name="FolderBox"/>
+              </DockPanel>
+              <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
+              <TextBlock Style="{StaticResource Hint}" Text="The only folder of this laptop the VM can see (as ~/shared). Put nothing there the AI must not read."/>
+              <TextBlock x:Name="FolderWarn" Style="{StaticResource Risk}" Foreground="#C62828" Visibility="Collapsed"/>
+              <TextBlock Style="{StaticResource Risk}" Text="Risk: what the AI writes here can run on Windows when you open or use it - scripts, shortcuts, git hooks, VS Code tasks. Treat it like a download from the internet. Read-only is safer."/>
+            </StackPanel>
+            <TextBlock x:Name="NoShareHint" Style="{StaticResource Hint}" Visibility="Collapsed"
+                       Text="No shared folder: the VM sees no file of this laptop and cannot reach its file sharing at all. Settings can add one later."/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Linux user"/>
+          <TextBox Grid.Row="4" Grid.Column="1" x:Name="UserBox"/>
+
+          <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Password"/>
+          <StackPanel Grid.Row="6" Grid.Column="1">
+            <TextBox x:Name="PassBox"/>
+            <TextBlock Style="{StaticResource Hint}" Text="For sudo, PuTTY and the Desktop. The Terminal button logs in with a key, no password needed. Every program on this laptop can try it over SSH - if others use this laptop, choose more than 'ai'."/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Memory (MB)"/>
+          <StackPanel Grid.Row="8" Grid.Column="1">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="at least" VerticalAlignment="Center" Margin="0,0,6,0"/>
+              <ComboBox x:Name="MinMemBox" Width="90" IsEditable="True"/>
+              <TextBlock Text="at most" VerticalAlignment="Center" Margin="14,0,6,0"/>
+              <ComboBox x:Name="MaxMemBox" Width="90" IsEditable="True"/>
+            </StackPanel>
+            <TextBlock Style="{StaticResource Hint}" Text="The VM takes what it needs between the two. Below 1024 MB, Hyper-V may squeeze a busy VM until it freezes."/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Processors / disk"/>
+          <StackPanel Grid.Row="10" Grid.Column="1" Orientation="Horizontal">
+            <ComboBox x:Name="CpuBox" Width="60"/>
+            <TextBlock Text="CPUs" VerticalAlignment="Center" Margin="6,0,18,0"/>
+            <ComboBox x:Name="DiskBox" Width="70" IsEditable="True"/>
+            <TextBlock Text="GB disk (grows as needed)" VerticalAlignment="Center" Margin="6,0,0,0"/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="12" Style="{StaticResource Label}" Text="Startup"/>
+          <CheckBox Grid.Row="12" Grid.Column="1" x:Name="AutoBox" Content="Start automatically with Windows" VerticalAlignment="Center"/>
+
+          <TextBlock Grid.Row="14" Style="{StaticResource Label}" Text="Network" VerticalAlignment="Top"/>
+          <StackPanel Grid.Row="14" Grid.Column="1">
+            <RadioButton x:Name="StrictBox" GroupName="Iso"><TextBlock Text="Strict (recommended): internet only - no home, office or cowork network" TextWrapping="Wrap"/></RadioButton>
+            <RadioButton x:Name="OpenBox" GroupName="Iso" Margin="0,4,0,0"><TextBlock Text="Open: the VM may also reach the local network" TextWrapping="Wrap"/></RadioButton>
+            <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=OpenBox, Converter={StaticResource B2V}}"
+                       Text="Risk: the AI can then reach your router, printers, NAS, smart devices and other computers - and the office network when you are there."/>
+          </StackPanel>
+
+          <TextBlock Grid.Row="16" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
+          <StackPanel Grid.Row="16" Grid.Column="1">
+            <TextBox x:Name="PortsBox"/>
+            <TextBlock Style="{StaticResource Hint}" Text="Optional, e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop then reach the VM's services (e.g. Docker containers) as localhost:8080; the local network does not. TCP only."/>
+            <TextBlock Style="{StaticResource Risk}" Text="Risk: browsers treat all of localhost as one site - a page from the VM on localhost gets the cookies of your other local apps. To just look at a page, open http://&lt;VM address&gt;:&lt;port&gt; instead."/>
+          </StackPanel>
+        </Grid>
+
+        <Expander Header="Advanced" Margin="0,14,0,0">
+          <Grid Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="160"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="8"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
+            <StackPanel Grid.Row="0" Grid.Column="1">
+              <WrapPanel>
+                <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,0"/>
+                <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,0"/>
+                <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,0"/>
+                <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,0"/>
+                <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,10,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+                <CheckBox x:Name="ClipBox" Content="with clipboard" Margin="0,0,18,0" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+              </WrapPanel>
+              <TextBlock Style="{StaticResource Hint}" Text="Installed from the official sources after the first boot (a few minutes more). Desktop: a light graphical desktop with Firefox, opened with the Desktop button (Remote Desktop); about 1 GB. With sound, the VM's sound plays on this laptop (the microphone is never shared)."/>
+              <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ToolDesktop, Converter={StaticResource B2V}}"
+                         Text="Desktop: Remote Desktop shares no drives or printers, and the clipboard only if you tick it. The VM can draw anything in that window - never type your Windows password there."/>
+              <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=SoundBox, Converter={StaticResource B2V}}"
+                         Text="Risk (low): sound is one more data stream from the VM into Windows' Remote Desktop program. Leave it off unless you need it."/>
+              <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ClipBox, Converter={StaticResource B2V}}"
+                         Text="Risk: the clipboard works both ways - the VM can read what you copy on Windows (often passwords) and put text into your clipboard."/>
+            </StackPanel>
+            <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
+            <StackPanel Grid.Row="2" Grid.Column="1">
+              <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
+              <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
+              <TextBlock Style="{StaticResource Hint}" Text="Where the VM's disk (a few GB), key and settings live. Terrarium finds VMs in both places."/>
+            </StackPanel>
+            <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Extra packages"/>
+            <StackPanel Grid.Row="4" Grid.Column="1">
+              <TextBox x:Name="PkgBox"/>
+              <TextBlock Style="{StaticResource Hint}" Text="Debian packages, separated by spaces, e.g. nodejs npm python3-pip"/>
+            </StackPanel>
+            <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Setup script"/>
+            <StackPanel Grid.Row="6" Grid.Column="1">
+              <DockPanel>
+                <Button x:Name="BtnScript" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
+                <TextBox x:Name="ScriptBox"/>
+              </DockPanel>
+              <TextBlock Style="{StaticResource Hint}" Text="Optional bash script, run once as root at the end of the first boot."/>
+            </StackPanel>
+            <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Time zone"/>
+            <StackPanel Grid.Row="8" Grid.Column="1">
+              <TextBox x:Name="TzBox"/>
+              <TextBlock Style="{StaticResource Hint}" Text="Empty: same as Windows. Otherwise e.g. Europe/Warsaw"/>
+            </StackPanel>
+            <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Keyboard"/>
+            <StackPanel Grid.Row="10" Grid.Column="1">
+              <TextBox x:Name="KbBox"/>
+              <TextBlock Style="{StaticResource Hint}" Text="Empty: same as Windows. Only matters on the VM's screen, not in the terminal."/>
+            </StackPanel>
+          </Grid>
+        </Expander>
+
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
 </Window>
 '@
 
 $settingsXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="VM settings" Width="560" SizeToContent="Height" ResizeMode="NoResize"
+        Title="VM settings" Width="640" MinWidth="520" SizeToContent="Height" ResizeMode="CanResizeWithGrip"
         WindowStartupLocation="CenterOwner" FontFamily="Segoe UI" FontSize="13" Background="White">
   <Window.Resources>
     <Style TargetType="TextBlock" x:Key="Label">
@@ -3791,107 +4093,155 @@ $settingsXaml = @'
     </Style>
     <BooleanToVisibilityConverter x:Key="B2V"/>
   </Window.Resources>
-  <StackPanel Margin="20,16,20,16">
-    <TextBlock x:Name="TitleText" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
-    <Grid>
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="150"/>
-        <ColumnDefinition Width="*"/>
-      </Grid.ColumnDefinitions>
-      <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-        <RowDefinition Height="Auto"/>
-      </Grid.RowDefinitions>
-      <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Memory (MB)"/>
-      <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal">
-        <TextBlock Text="at least" VerticalAlignment="Center" Margin="0,0,6,0"/>
-        <ComboBox x:Name="MinMemBox" Width="90" IsEditable="True"/>
-        <TextBlock Text="at most" VerticalAlignment="Center" Margin="14,0,6,0"/>
-        <ComboBox x:Name="MaxMemBox" Width="90" IsEditable="True"/>
+  <!-- Buttons stay visible; the rest scrolls when the window would be taller than the screen. -->
+  <DockPanel>
+    <StackPanel DockPanel.Dock="Bottom" Margin="20,0,20,16">
+      <TextBlock x:Name="ErrorText" Foreground="#C62828" TextWrapping="Wrap" Margin="0,10,0,0" Visibility="Collapsed"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+        <Button x:Name="BtnOk" Content="Apply" IsDefault="True" Margin="0,0,8,0" Background="#1F6FEB" Foreground="White" FontWeight="SemiBold"/>
+        <Button x:Name="BtnCancel" Content="Cancel" IsCancel="True"/>
       </StackPanel>
-      <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Processors"/>
-      <StackPanel Grid.Row="2" Grid.Column="1">
-        <ComboBox x:Name="CpuBox" Width="60" HorizontalAlignment="Left"/>
-        <TextBlock x:Name="CpuHint" Style="{StaticResource Hint}" Text="Stop the VM to change this." Visibility="Collapsed"/>
-      </StackPanel>
-      <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Startup"/>
-      <CheckBox Grid.Row="4" Grid.Column="1" x:Name="AutoBox" Content="Start automatically with Windows" VerticalAlignment="Center"/>
-      <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Network" VerticalAlignment="Top"/>
-      <StackPanel Grid.Row="6" Grid.Column="1">
-        <RadioButton x:Name="StrictBox" GroupName="Iso" Content="Strict (recommended): internet only"/>
-        <RadioButton x:Name="OpenBox" GroupName="Iso" Content="Open: may also reach the local network" Margin="0,4,0,0"/>
-        <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=OpenBox, Converter={StaticResource B2V}}"
-                   Text="Risk: the AI can then reach your router, printers, NAS, smart devices and other computers - and the office network when you are there."/>
-      </StackPanel>
-      <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Shared folder" VerticalAlignment="Top" Margin="0,4,10,0"/>
-      <StackPanel Grid.Row="8" Grid.Column="1">
-        <CheckBox x:Name="ShareBox" Content="Share a folder of this laptop with the VM" Margin="0,4,0,6"/>
-        <StackPanel IsEnabled="{Binding IsChecked, ElementName=ShareBox}">
-          <DockPanel>
-            <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
-            <TextBox x:Name="FolderBox" Padding="4,3"/>
-          </DockPanel>
-          <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
-          <TextBlock x:Name="FolderHint" Style="{StaticResource Hint}" Text="The files stay where they are; the VM just sees the new folder as ~/shared."/>
-          <TextBlock x:Name="FolderWarn" Style="{StaticResource Risk}" Foreground="#C62828" Visibility="Collapsed"/>
-          <TextBlock Style="{StaticResource Risk}" Text="Risk: what the AI writes here can run on Windows when you open or use it - scripts, shortcuts, git hooks, VS Code tasks. Read-only is safer."/>
-        </StackPanel>
-        <TextBlock x:Name="NoShareHint" Style="{StaticResource Hint}" Visibility="Collapsed"
-                   Text="No shared folder: the VM sees no file of this laptop and cannot reach its file sharing at all. Adding one needs the VM running."/>
-      </StackPanel>
-      <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
-      <StackPanel Grid.Row="10" Grid.Column="1">
-        <TextBox x:Name="PortsBox" Padding="4,3"/>
-        <TextBlock Style="{StaticResource Hint}" Text="e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop reach them as localhost:8080; the local network does not. Empty: none."/>
-        <TextBlock Style="{StaticResource Risk}" Text="Risk: a page from the VM on localhost gets the cookies of your other local apps. To just look at a page, open http://&lt;VM address&gt;:&lt;port&gt; instead."/>
-      </StackPanel>
-    </Grid>
-    <Expander Header="Advanced" Margin="0,14,0,0">
-      <Grid Margin="0,8,0,0">
-        <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="150"/>
-          <ColumnDefinition Width="*"/>
-        </Grid.ColumnDefinitions>
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
-          <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
-        <StackPanel Grid.Row="0" Grid.Column="1">
-          <WrapPanel>
-            <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,4"/>
-            <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,4"/>
-            <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,4"/>
-            <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,4"/>
-            <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,10,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
-            <CheckBox x:Name="ClipBox" Content="with clipboard" Margin="0,0,18,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
-          </WrapPanel>
-          <TextBlock x:Name="ToolHint" Style="{StaticResource Hint}" Text="Tick what to add; it is installed when you click Apply (a few minutes)."/>
-          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=SoundBox, Converter={StaticResource B2V}}"
-                     Text="Risk (low): sound is one more data stream from the VM into Windows' Remote Desktop program. Leave it off unless you need it."/>
-          <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ClipBox, Converter={StaticResource B2V}}"
-                     Text="Risk: the clipboard works both ways - the VM can read what you copy on Windows (often passwords) and put text into your clipboard."/>
-        </StackPanel>
-        <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
-        <StackPanel Grid.Row="2" Grid.Column="1">
-          <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
-          <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
-          <TextBlock Style="{StaticResource Hint}" Text="Choosing the other place moves the VM's disk, checkpoints and key there. It works while the VM runs; the shared folder stays."/>
-        </StackPanel>
-      </Grid>
-    </Expander>
-    <TextBlock x:Name="ErrorText" Foreground="#C62828" TextWrapping="Wrap" Margin="0,12,0,0" Visibility="Collapsed"/>
-    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
-      <Button x:Name="BtnOk" Content="Apply" IsDefault="True" Margin="0,0,8,0" Background="#1F6FEB" Foreground="White" FontWeight="SemiBold"/>
-      <Button x:Name="BtnCancel" Content="Cancel" IsCancel="True"/>
     </StackPanel>
-  </StackPanel>
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+      <StackPanel Margin="20,16,20,4">
+        <TextBlock x:Name="TitleText" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,12"/>
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="150"/>
+            <ColumnDefinition Width="*"/>
+          </Grid.ColumnDefinitions>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Memory (MB)"/>
+          <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal">
+            <TextBlock Text="at least" VerticalAlignment="Center" Margin="0,0,6,0"/>
+            <ComboBox x:Name="MinMemBox" Width="90" IsEditable="True"/>
+            <TextBlock Text="at most" VerticalAlignment="Center" Margin="14,0,6,0"/>
+            <ComboBox x:Name="MaxMemBox" Width="90" IsEditable="True"/>
+          </StackPanel>
+          <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Processors"/>
+          <StackPanel Grid.Row="2" Grid.Column="1">
+            <ComboBox x:Name="CpuBox" Width="60" HorizontalAlignment="Left"/>
+            <TextBlock x:Name="CpuHint" Style="{StaticResource Hint}" Text="Stop the VM to change this." Visibility="Collapsed"/>
+          </StackPanel>
+          <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Startup"/>
+          <CheckBox Grid.Row="4" Grid.Column="1" x:Name="AutoBox" Content="Start automatically with Windows" VerticalAlignment="Center"/>
+          <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="Network" VerticalAlignment="Top"/>
+          <StackPanel Grid.Row="6" Grid.Column="1">
+            <RadioButton x:Name="StrictBox" GroupName="Iso" Content="Strict (recommended): internet only"/>
+            <RadioButton x:Name="OpenBox" GroupName="Iso" Content="Open: may also reach the local network" Margin="0,4,0,0"/>
+            <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=OpenBox, Converter={StaticResource B2V}}"
+                       Text="Risk: the AI can then reach your router, printers, NAS, smart devices and other computers - and the office network when you are there."/>
+          </StackPanel>
+          <TextBlock Grid.Row="8" Style="{StaticResource Label}" Text="Shared folder" VerticalAlignment="Top" Margin="0,4,10,0"/>
+          <StackPanel Grid.Row="8" Grid.Column="1">
+            <CheckBox x:Name="ShareBox" Margin="0,4,0,6"><TextBlock Text="Share a folder of this laptop with the VM" TextWrapping="Wrap"/></CheckBox>
+            <StackPanel IsEnabled="{Binding IsChecked, ElementName=ShareBox}">
+              <DockPanel>
+                <Button x:Name="BtnBrowse" DockPanel.Dock="Right" Content="Browse..." Margin="6,0,0,0"/>
+                <TextBox x:Name="FolderBox" Padding="4,3"/>
+              </DockPanel>
+              <CheckBox x:Name="ReadOnlyBox" Content="The VM may only read this folder" Margin="0,6,0,0"/>
+              <TextBlock x:Name="FolderHint" Style="{StaticResource Hint}" Text="The files stay where they are; the VM just sees the new folder as ~/shared."/>
+              <TextBlock x:Name="FolderWarn" Style="{StaticResource Risk}" Foreground="#C62828" Visibility="Collapsed"/>
+              <TextBlock Style="{StaticResource Risk}" Text="Risk: what the AI writes here can run on Windows when you open or use it - scripts, shortcuts, git hooks, VS Code tasks. Read-only is safer."/>
+            </StackPanel>
+            <TextBlock x:Name="NoShareHint" Style="{StaticResource Hint}" Visibility="Collapsed"
+                       Text="No shared folder: the VM sees no file of this laptop and cannot reach its file sharing at all. Adding one needs the VM running."/>
+          </StackPanel>
+          <TextBlock Grid.Row="10" Style="{StaticResource Label}" Text="Ports to this laptop" VerticalAlignment="Top" Margin="0,4,10,0"/>
+          <StackPanel Grid.Row="10" Grid.Column="1">
+            <TextBox x:Name="PortsBox" Padding="4,3"/>
+            <TextBlock Style="{StaticResource Hint}" Text="e.g. 8080, 5432, 3000:80 (laptop:VM). Apps on this laptop reach them as localhost:8080; the local network does not. Empty: none."/>
+            <TextBlock Style="{StaticResource Risk}" Text="Risk: a page from the VM on localhost gets the cookies of your other local apps. To just look at a page, open http://&lt;VM address&gt;:&lt;port&gt; instead."/>
+          </StackPanel>
+        </Grid>
+        <Expander Header="Advanced" Margin="0,14,0,0">
+          <Grid Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="150"/>
+              <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+              <RowDefinition Height="Auto"/><RowDefinition Height="10"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Style="{StaticResource Label}" Text="Install" VerticalAlignment="Top"/>
+            <StackPanel Grid.Row="0" Grid.Column="1">
+              <WrapPanel>
+                <CheckBox x:Name="ToolDocker" Content="Docker" Margin="0,0,18,4"/>
+                <CheckBox x:Name="ToolClaudeCode" Content="Claude Code" Margin="0,0,18,4"/>
+                <CheckBox x:Name="ToolCodex" Content="Codex" Margin="0,0,18,4"/>
+                <CheckBox x:Name="ToolDesktop" Content="Desktop (XFCE)" Margin="0,0,6,4"/>
+                <CheckBox x:Name="SoundBox" Content="with sound" Margin="0,0,10,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+                <CheckBox x:Name="ClipBox" Content="with clipboard" Margin="0,0,18,4" IsEnabled="{Binding IsChecked, ElementName=ToolDesktop}"/>
+              </WrapPanel>
+              <TextBlock x:Name="ToolHint" Style="{StaticResource Hint}" Text="Tick what to add; it is installed when you click Apply (a few minutes)."/>
+              <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=SoundBox, Converter={StaticResource B2V}}"
+                         Text="Risk (low): sound is one more data stream from the VM into Windows' Remote Desktop program. Leave it off unless you need it."/>
+              <TextBlock Style="{StaticResource Risk}" Visibility="{Binding IsChecked, ElementName=ClipBox, Converter={StaticResource B2V}}"
+                         Text="Risk: the clipboard works both ways - the VM can read what you copy on Windows (often passwords) and put text into your clipboard."/>
+            </StackPanel>
+            <TextBlock Grid.Row="2" Style="{StaticResource Label}" Text="Stored in" VerticalAlignment="Top"/>
+            <StackPanel Grid.Row="2" Grid.Column="1">
+              <RadioButton x:Name="LocHomeBox" GroupName="Loc"/>
+              <RadioButton x:Name="LocProgramBox" GroupName="Loc" Margin="0,4,0,0"/>
+              <TextBlock Style="{StaticResource Hint}" Text="Choosing the other place moves the VM's disk, checkpoints and key there. It works while the VM runs; the shared folder stays."/>
+            </StackPanel>
+            <TextBlock Grid.Row="4" Style="{StaticResource Label}" Text="Desktop size" VerticalAlignment="Top" Margin="0,4,10,0"/>
+            <StackPanel Grid.Row="4" Grid.Column="1">
+              <ComboBox x:Name="DesktopSizeBox" Width="200" IsEditable="True" HorizontalAlignment="Left"/>
+              <TextBlock x:Name="DesktopSizeHint" Style="{StaticResource Hint}" Text="Fit: a window as large as this screen allows. Or type a size, e.g. 1920x1080. From the next Desktop connection; the arrow next to the Desktop button changes it too."/>
+            </StackPanel>
+            <TextBlock Grid.Row="6" Style="{StaticResource Label}" Text="SSH from the network" VerticalAlignment="Top" Margin="0,2,10,0"/>
+            <StackPanel Grid.Row="6" Grid.Column="1">
+              <CheckBox x:Name="LanBox"><TextBlock Text="Other computers on my network may log in (PuTTY, ssh)" TextWrapping="Wrap"/></CheckBox>
+              <StackPanel x:Name="LanPanel" Visibility="{Binding IsChecked, ElementName=LanBox, Converter={StaticResource B2V}}" Margin="0,6,0,0">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="Laptop port" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                  <TextBox x:Name="LanPortBox" Width="60" Padding="4,3"/>
+                </StackPanel>
+                <TextBlock x:Name="LanHint" Style="{StaticResource Hint}"/>
+                <TextBlock Style="{StaticResource Risk}" Foreground="#C62828" Text="Risk: anyone on your network can try the Linux password (the default 'ai' is easy to guess - change it in the VM with passwd). The AI is root in the VM and controls what answers on that port, e.g. a fake login. Only on networks Windows calls Private or Domain; the VM still cannot open connections into your network."/>
+              </StackPanel>
+              <TextBlock x:Name="LanOffHint" Style="{StaticResource Hint}" Text="Off: only this laptop reaches the VM."/>
+            </StackPanel>
+          </Grid>
+        </Expander>
+      </StackPanel>
+    </ScrollViewer>
+  </DockPanel>
 </Window>
 '@
+
+function New-WrapText([string]$Text) {
+    # Content for a CheckBox or RadioButton that wraps instead of being cut off at the window's edge.
+    $t = New-Object System.Windows.Controls.TextBlock
+    $t.Text = $Text
+    $t.TextWrapping = 'Wrap'
+    return $t
+}
+
+function Set-DialogFit($Dialog) {
+    # Never taller than the screen's work area (the content scrolls instead), and moved up when
+    # it grows - e.g. when Advanced is opened - so its buttons stay on screen.
+    $wa = [System.Windows.SystemParameters]::WorkArea
+    $Dialog.MaxHeight = $wa.Height
+    $Dialog.Add_SizeChanged({
+        param($w, $e)
+        $area = [System.Windows.SystemParameters]::WorkArea
+        if ($w.Top + $w.ActualHeight -gt $area.Bottom) { $w.Top = [math]::Max($area.Top, $area.Bottom - $w.ActualHeight) }
+        if ($w.Top -lt $area.Top) { $w.Top = $area.Top }
+    })
+}
 
 function New-Window([string]$Xaml) {
     $reader = New-Object System.Xml.XmlNodeReader ([xml]$Xaml)
@@ -3911,7 +4261,7 @@ function New-Brush([string]$Hex) {
 $win = New-Window $mainXaml
 $ui = @{}
 foreach ($n in 'VersionText', 'Banner', 'BtnFix', 'BtnRecheck', 'BannerTitle', 'BannerDetail', 'BusyText', 'BusyBar',
-    'BtnNew', 'BtnStart', 'BtnStop', 'BtnTerminal', 'TerminalChoice', 'BtnDesktop', 'BtnFolder', 'BtnScreen', 'BtnTest', 'BtnDiagnose', 'BtnSettings', 'BtnRemove',
+    'BtnNew', 'BtnStart', 'BtnStop', 'BtnTerminal', 'TerminalChoice', 'BtnDesktop', 'DesktopChoice', 'BtnFolder', 'BtnScreen', 'BtnTest', 'BtnDiagnose', 'BtnSettings', 'BtnRemove',
     'VmList', 'EmptyText', 'BtnCopyLog', 'BtnOpenLog', 'BtnLogFolder', 'BtnClearLog', 'LogList') {
     $ui[$n] = $win.FindName($n)
 }
@@ -4048,7 +4398,7 @@ function Update-VmList {
         try { $vms = @(Get-AicVm) } catch { }
     }
     $sig = ($vms | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}|{10}|{11}|{12}|{13}|{14}' -f $_.Name, $_.State, $_.Status, $_.MemoryMB, $_.MemoryMinMB, $_.MemoryMaxMB, $_.Cpu, $_.AutoStart, $_.Isolation, $_.SharedFolder, $_.SharedReadOnly,
-        (Get-VmHealth $_), ($_.Ports -join ','), ($_.Tools -join ','), "$($_.Sound)$($_.Clipboard)" }) -join ';'
+        (Get-VmHealth $_), ($_.Ports -join ','), ($_.Tools -join ','), "$($_.Sound)$($_.Clipboard)$($_.DesktopSize)$($_.LanSshPort)" }) -join ';'
     if ($sig -eq $script:VmSignature) { Update-Buttons; return }
     $script:VmSignature = $sig
     $selected = Get-SelectedVm
@@ -4084,6 +4434,7 @@ function Update-Buttons {
     $ui.BtnStop.IsEnabled = -not $busy -and $running
     $ui.BtnTerminal.IsEnabled = $running
     $ui.BtnDesktop.IsEnabled = $running -and @($v.Raw.Tools) -contains 'Desktop'
+    $ui.DesktopChoice.IsEnabled = -not $busy -and $v -and @($v.Raw.Tools) -contains 'Desktop'
     $ui.BtnFolder.IsEnabled = $v -and [bool]$v.Raw.SharedFolder
     $ui.BtnScreen.IsEnabled = $v -and -not $off
     $ui.BtnTest.IsEnabled = -not $busy -and $running
@@ -4176,6 +4527,12 @@ function Confirm-OpenNetwork([string]$Name) {
     return [System.Windows.MessageBox]::Show($msg, 'Terrarium - Open network', 'YesNo', 'Warning') -eq 'Yes'
 }
 
+function Confirm-LanSsh([string]$Name, [int]$Port) {
+    # Opens the VM to the other computers of the network: ask once more.
+    $msg = "Let other computers on your network log in to '$Name'?`n`nAnyone on the network this laptop is on - at home, in the office - can then try the Linux password on port $Port of this laptop, and whoever logs in has a shell in the VM with its internet.`n`nWindows opens the port only on networks it calls Private or Domain, not on Public ones (cafe, hotel). The VM still cannot reach your network on its own. Turn it off when you no longer need it."
+    return [System.Windows.MessageBox]::Show($msg, 'Terrarium - SSH from the network', 'YesNo', 'Warning') -eq 'Yes'
+}
+
 function Update-FolderWarning($K) {
     # Red flags of the folder in the dialog (Terrarium inside, cloud sync, secrets), shown in red.
     $w = @()
@@ -4199,6 +4556,7 @@ function Get-VmRisks($Vm) {
     if (@($Vm.Ports).Count) { $r += 'localhost ports' }
     if ($Vm.Sound) { $r += 'sound' }
     if ($Vm.Clipboard) { $r += 'clipboard' }
+    if ($Vm.LanSshPort) { $r += "SSH from network ($($Vm.LanSshPort))" }
     if ($Vm.SharedFolder -and -not $Vm.SharedReadOnly) { $r += 'writable share' }
     return $r -join ', '
 }
@@ -4208,6 +4566,7 @@ function Show-NewVmDialog {
     # reliable (GetNewClosure would move $script: variables into a separate module scope).
     $d = New-Window $newXaml
     $d.Owner = $win
+    Set-DialogFit $d
     $c = @{ Window = $d; Result = $null; FolderTouched = $false }
     foreach ($n in 'NameBox', 'BtnBrowse', 'FolderBox', 'ReadOnlyBox', 'UserBox', 'PassBox', 'MinMemBox', 'MaxMemBox', 'CpuBox',
         'DiskBox', 'AutoBox', 'StrictBox', 'OpenBox', 'PortsBox', 'LocHomeBox', 'LocProgramBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'ClipBox', 'PkgBox', 'BtnScript', 'ScriptBox', 'TzBox', 'KbBox', 'ErrorText', 'BtnOk', 'BtnCancel',
@@ -4217,8 +4576,8 @@ function Show-NewVmDialog {
     $c.Existing = @($script:VmItems | ForEach-Object { $_.Name })
     $i = 1; while ($c.Existing -contains "agent$i") { $i++ }
     $script:Dlg = $c
-    $c.LocHomeBox.Content = "Your user folder:  $script:HomeRoot"
-    $c.LocProgramBox.Content = "Program folder:  $script:ProgramRoot"
+    $c.LocHomeBox.Content = New-WrapText "Your user folder:  $script:HomeRoot"
+    $c.LocProgramBox.Content = New-WrapText "Program folder:  $script:ProgramRoot"
     $c.LocHomeBox.IsChecked = $true
     if ($script:ProgramRoot -ieq $script:HomeRoot) { $c.LocProgramBox.Visibility = 'Collapsed' }
     $c.SharedRoot = Join-Path $script:HomeRoot 'data\shared'
@@ -4346,10 +4705,11 @@ New-AicVm @p | Out-Null
 function Show-SettingsDialog($Raw) {
     $d = New-Window $settingsXaml
     $d.Owner = $win
+    Set-DialogFit $d
     $c = @{ Window = $d; Result = $null; Raw = $Raw }
     foreach ($n in 'TitleText', 'MinMemBox', 'MaxMemBox', 'CpuBox', 'CpuHint', 'AutoBox', 'StrictBox', 'OpenBox', 'FolderBox', 'BtnBrowse', 'ReadOnlyBox',
         'FolderHint', 'PortsBox', 'ToolDocker', 'ToolClaudeCode', 'ToolCodex', 'ToolDesktop', 'SoundBox', 'ClipBox', 'ToolHint', 'LocHomeBox', 'LocProgramBox', 'ErrorText', 'BtnOk', 'BtnCancel',
-        'ShareBox', 'FolderWarn', 'NoShareHint') { $c[$n] = $d.FindName($n) }
+        'ShareBox', 'FolderWarn', 'NoShareHint', 'DesktopSizeBox', 'DesktopSizeHint', 'LanBox', 'LanPanel', 'LanPortBox', 'LanHint', 'LanOffHint') { $c[$n] = $d.FindName($n) }
     $script:Dlg = $c
     $c.TitleText.Text = "Settings of $($Raw.Name)"
     Set-Combo $c.MinMemBox @(512, 1024, 2048, 4096) $Raw.MemoryMinMB
@@ -4378,8 +4738,8 @@ function Show-SettingsDialog($Raw) {
         if ($f.ShowDialog() -eq 'OK') { $k.FolderBox.Text = $f.SelectedPath; [void](Update-FolderWarning $k) }
     })
     if ($Raw.State -ne 'Running') { $c.FolderHint.Text += ' Start the VM to switch read-only on or off.' }
-    $c.LocHomeBox.Content = "Your user folder:  $script:HomeRoot"
-    $c.LocProgramBox.Content = "Program folder:  $script:ProgramRoot"
+    $c.LocHomeBox.Content = New-WrapText "Your user folder:  $script:HomeRoot"
+    $c.LocProgramBox.Content = New-WrapText "Program folder:  $script:ProgramRoot"
     if ($Raw.Location -eq 'Program') { $c.LocProgramBox.IsChecked = $true } else { $c.LocHomeBox.IsChecked = $true }
     if ($script:ProgramRoot -ieq $script:HomeRoot) { $c.LocProgramBox.Visibility = 'Collapsed' }
     $c.PortsBox.Text = @($Raw.Ports) -join ', '
@@ -4392,6 +4752,35 @@ function Show-SettingsDialog($Raw) {
         elseif ($Raw.State -ne 'Running') { $box.IsEnabled = $false }
     }
     if ($Raw.State -ne 'Running') { $c.ToolHint.Text = 'Start the VM to install programs.' }
+
+    # Desktop size: the list shows names, the VM keeps Fit, Full or WIDTHxHEIGHT.
+    $sizeNames = [ordered]@{ Fit = 'Fit this screen'; Full = 'Full screen' }
+    $c.SizeNames = $sizeNames
+    $cur = "$($Raw.DesktopSize)"; if (-not $cur) { $cur = 'Fit' }
+    Set-Combo $c.DesktopSizeBox (@($sizeNames.Values) + @('1280x720', '1600x900', '1920x1080', '2560x1440')) $(if ($sizeNames.Contains($cur)) { $sizeNames[$cur] } else { $cur })
+    try { $fit = Get-AicDesktopPixels 'Fit'; $c.DesktopSizeHint.Text = "Fit: a window as large as this screen allows (now $($fit.Width) x $($fit.Height)). Or type a size, e.g. 1920x1080. From the next Desktop connection; the arrow next to the Desktop button changes it too." } catch { }
+
+    # SSH from the network: other computers log in with the VM's Linux password.
+    $c.LanWasOn = [bool]$Raw.LanSshPort
+    $c.LanBox.IsChecked = $c.LanWasOn
+    if ($c.LanWasOn) {
+        $c.LanPortBox.Text = "$($Raw.LanSshPort)"
+        $c.LanOffHint.Visibility = 'Collapsed'
+        try {
+            $info = Get-AicLanSshInfo -Name $Raw.Name
+            $t = "From another computer: $($info.Command)"
+            if ($info.Addresses.Count) { $t += "  (or $(@($info.Addresses | ForEach-Object { "$_" }) -join ', '))" }
+            $t += ', with the Linux password.'
+            if ($info.HostKeys.Count) { $t += " The first time, PuTTY shows the VM's key; it must be: $(@($info.HostKeys) -join '  or  ')" }
+            if (-not $info.Addresses.Count) { $t += ' No network of this laptop is Private or Domain in Windows, so nobody gets in now.' }
+            $c.LanHint.Text = $t
+        } catch { $c.LanHint.Text = "Laptop port $($Raw.LanSshPort)." }
+    } else {
+        $c.LanPortBox.Text = '22'
+        try { $c.LanPortBox.Text = "$(Get-AicLanSshDefaultPort -Name $Raw.Name)" } catch { }
+        $c.LanHint.Text = "Then from another computer: putty $(if ($c.LanPortBox.Text -ne '22') { "-P $($c.LanPortBox.Text) " })$($Raw.User)@$($env:COMPUTERNAME.ToLower()) - with the Linux password. Only on networks Windows calls Private or Domain."
+    }
+    $c.LanBox.Add_Click({ $k = $script:Dlg; $k.LanOffHint.Visibility = if ($k.LanBox.IsChecked) { 'Collapsed' } else { 'Visible' } })
 
     $c.BtnOk.Add_Click({
         $k = $script:Dlg; $r = $k.Raw
@@ -4431,6 +4820,20 @@ function Show-SettingsDialog($Raw) {
         if ($install.Count) { $p.Install = $install }
         $loc = if ($k.LocProgramBox.IsChecked) { 'Program' } else { 'Home' }
         if ($loc -ne $r.Location) { $p.Location = $loc }
+        $sizeText = $k.DesktopSizeBox.Text.Trim()
+        foreach ($e in $k.SizeNames.GetEnumerator()) { if ($sizeText -eq $e.Value) { $sizeText = $e.Key } }
+        try { $size = ConvertTo-AicDesktopSize $sizeText } catch { $k.ErrorText.Text = $_.Exception.Message; $k.ErrorText.Visibility = 'Visible'; return }
+        $oldSize = "$($r.DesktopSize)"; if (-not $oldSize) { $oldSize = 'Fit' }
+        if ($size -ne $oldSize) { $p.DesktopSize = $size }
+        $lanPort = 0
+        if ($k.LanBox.IsChecked) {
+            $lanPort = Get-IntOrNull $k.LanPortBox.Text
+            if (-not $lanPort -or $lanPort -lt 1 -or $lanPort -gt 65535) { $k.ErrorText.Text = 'SSH from the network: the laptop port is a number from 1 to 65535.'; $k.ErrorText.Visibility = 'Visible'; return }
+        }
+        if ($lanPort -ne [int]$r.LanSshPort) {
+            if ($lanPort -and -not $k.LanWasOn -and -not (Confirm-LanSsh $r.Name $lanPort)) { return }
+            $p.LanSshPort = $lanPort
+        }
         $k.Result = $p
         $k.Window.DialogResult = $true
     })
@@ -4519,6 +4922,45 @@ $ui.BtnDesktop.Add_Click({
     $v = Get-SelectedVm; if (-not $v) { return }
     Open-Vm $v 'Desktop'
 })
+
+# The small arrow next to Desktop: the size of the desktop, kept for each VM. Windows' Remote
+# Desktop program does not resize the VM's desktop with its window, so the size is chosen here.
+$ui.DesktopChoice.Add_Click({
+    $v = Get-SelectedVm; if (-not $v) { return }
+    $cur = "$($v.Raw.DesktopSize)"; if (-not $cur) { $cur = 'Fit' }
+    $m = $ui.DesktopChoice.ContextMenu
+    $known = @($m.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] } | ForEach-Object { $_.Tag })
+    foreach ($it in $m.Items) {
+        if ($it -isnot [System.Windows.Controls.MenuItem]) { continue }
+        $it.IsChecked = ($it.Tag -eq $cur) -or ($it.Tag -eq 'Other' -and $known -notcontains $cur)
+        if ($it.Tag -eq 'Other') { $it.Header = if ($known -notcontains $cur) { "Other size ($($cur -replace 'x', ' x '))..." } else { 'Other size...' } }
+        if ($it.Tag -in 'Fit', 'Full') {
+            $px = $null; try { $px = Get-AicDesktopPixels $it.Tag } catch { }
+            $label = if ($it.Tag -eq 'Fit') { 'Fit this screen (window)' } else { 'Full screen' }
+            $it.Header = if ($px) { "$label  -  $($px.Width) x $($px.Height)" } else { $label }
+        }
+    }
+    $m.PlacementTarget = $ui.BtnDesktop
+    $m.Placement = 'Bottom'
+    $m.IsOpen = $true
+})
+foreach ($it in $ui.DesktopChoice.ContextMenu.Items) {
+    if ($it -isnot [System.Windows.Controls.MenuItem]) { continue }
+    $it.Add_Click({
+        param($sender)
+        $v = Get-SelectedVm; if (-not $v) { return }
+        $size = $sender.Tag
+        if ($size -eq 'Other') {
+            Add-Type -AssemblyName Microsoft.VisualBasic
+            $cur = "$($v.Raw.DesktopSize)"; if ($cur -notmatch 'x') { $cur = '1920x1080' }
+            $size = [Microsoft.VisualBasic.Interaction]::InputBox("Size of $($v.Name)'s desktop, in pixels (width x height), e.g. 1920x1080:", 'Terrarium - desktop size', $cur)
+            if (-not $size.Trim()) { return }
+        }
+        try { $size = ConvertTo-AicDesktopSize $size } catch { [System.Windows.MessageBox]::Show($_.Exception.Message, 'Terrarium', 'OK', 'Warning') | Out-Null; return }
+        if ($script:Op) { Add-LogLine 'Warn' "Wait until '$($script:Op.Title)' is done, then choose the size again."; return }
+        Start-Op -Title "Desktop size of $($v.Name)" -Arg @($v.Name, $size) -Script 'param($a) Set-AicVm -Name $a[0] -DesktopSize $a[1] -Confirm:$false | Out-Null'
+    })
+}
 
 $ui.BtnRemove.Add_Click({
     $v = Get-SelectedVm; if (-not $v) { return }
